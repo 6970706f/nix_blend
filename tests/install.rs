@@ -1024,8 +1024,16 @@ fn search_shows_results_with_details() {
     let text = stdout(&output);
     assert!(text.find("Attribute: foo").unwrap() < text.find("Attribute: bar").unwrap());
     assert!(text.contains("License: MIT"), "{text}");
-    assert!(text.contains("Status: Available"), "{text}");
-    assert!(text.contains("Status: Unknown"), "{text}");
+    // Availability is only reported when evaluated through the system configuration, and
+    // the catalog looks for it in the real `/etc/nixos`, absent from CI and Nix builds.
+    let foo_status = if Path::new("/etc/nixos/flake.nix").exists() {
+        "Status: Available"
+    } else {
+        "Status: Unknown"
+    };
+    let (foo, bar) = text.split_once("Attribute: bar").unwrap();
+    assert!(foo.contains(foo_status), "{text}");
+    assert!(bar.contains("Status: Unknown"), "{text}");
     assert!(text.contains("Showing 2 of 2 result(s)."), "{text}");
 }
 
