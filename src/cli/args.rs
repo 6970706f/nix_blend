@@ -2,12 +2,12 @@
 
 use clap::{Parser, Subcommand};
 
-/// Package manager for NixOS.
+/// Package manager for NixOS. Without a command, opens the interactive interface.
 #[derive(Debug, Parser)]
 #[command(name = "nixblend", version)]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -60,12 +60,17 @@ mod tests {
     fn parse(arguments: &[&str]) -> Result<Command, clap::Error> {
         let mut all = vec!["nixblend"];
         all.extend_from_slice(arguments);
-        Cli::try_parse_from(all).map(|cli| cli.command)
+        Cli::try_parse_from(all).map(|cli| cli.command.expect("a command was given"))
     }
 
     #[test]
     fn definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn no_command_means_the_interactive_interface() {
+        assert!(Cli::try_parse_from(["nixblend"]).unwrap().command.is_none());
     }
 
     #[test]

@@ -6,7 +6,8 @@ change is validated, shown as a diff and confirmed before it is written.
 
 ```bash
 cargo build --release
-./target/release/nixblend search ripgrep
+./target/release/nixblend                      # interactive interface
+./target/release/nixblend search ripgrep       # or a single command
 sudo ./target/release/nixblend install ripgrep
 ```
 
@@ -14,6 +15,38 @@ The first `install` or `remove` asks for the file to manage and saves it in
 `$XDG_DATA_HOME/nixblend/config.toml` (by default
 `~/.local/share/nixblend/config.toml`), if the file proves usable. To choose another
 file, edit or delete that one.
+
+## Interactive interface
+
+Run `nixblend` without a command, in a terminal. It lists what the managed file declares,
+searches nixpkgs, and runs the same operations as the commands, with the same validations
+and protections. Run it with `sudo` if the managed file needs it, as with the commands.
+
+| Key | Action |
+| --- | --- |
+| `/` | Search packages. While typing, every letter is text |
+| Up, Down, PgUp, PgDn | Move in the list |
+| Enter | Details of the selected package, in the panel or on their own in narrow terminals |
+| `i` | Install the selected search result |
+| `r` | Remove the selected declaration |
+| `R` | Reinstall: validate the configuration and rebuild |
+| Esc | Back, or stop what is running |
+| `y`, `n` | Answer a question. Nothing is changed without a `y` |
+| `?` | Show the keys |
+| `q` | Quit |
+| Ctrl+C | Quit from anywhere, ending what is running |
+
+An operation shows the package, its source, the file, the diff and the question on one
+screen. The rebuild takes over the terminal while it runs, so that its output and the `sudo`
+password prompt work as usual, and the interface comes back when it ends.
+
+It adapts to the terminal: real colors where available, then 256 or 16 colors, none with
+`NO_COLOR`, and plain ASCII in a locale that is not UTF-8. The details panel needs 90 columns
+and the logo 20 rows. Without a terminal, as in a pipe, it explains what to use instead.
+
+The Nix logo is the official artwork from
+[NixOS/nixos-artwork](https://github.com/NixOS/nixos-artwork), reduced from the
+`nixos-icons` package.
 
 ## Commands
 
@@ -146,10 +179,10 @@ structures, and the real Nix parser validates every result.
 Hexagonal, as modules of a single crate. Dependencies point inwards:
 
 ```text
-cli ──> application ──> domain
-              ^
-              │ implements the ports
-       infrastructure
+cli, tui ──> application ──> domain
+                   ^
+                   │ implements the ports
+            infrastructure
 ```
 
 - `domain`: packages, sources, declarations and the rules that relate them. It knows
@@ -157,7 +190,10 @@ cli ──> application ──> domain
 - `application`: one module per use case, and `ports.rs` with the interfaces they need.
 - `infrastructure`: Nix tools, the parser for package files, atomic writes, processes,
   signals, configuration and privileges.
-- `cli`: arguments and presentation.
+- `cli`: arguments and presentation for single commands.
+- `tui`: the interactive interface. The use cases run in their own thread and talk to it
+  through the `Interaction` port, so it holds no business rules. `app.rs` is the state and
+  `view.rs` the drawing, both testable without a terminal.
 - `main.rs`: the only place that connects all of them.
 
 To use another package source, implement `PackageCatalog` and `CatalogProvider`.
@@ -172,6 +208,8 @@ cargo test
 
 Do not run the tests as root: as root the binary ignores `PATH`, so the simulated tools
 would be replaced by the real ones. The tests refuse to start in that case.
+
+`tests/tui.rs` drives the interface in a real pseudo-terminal, through `script`.
 
 `tests/sudo.rs` exercises the elevated paths inside a user namespace. It needs subordinate
 IDs and a NixOS system profile, and reports `SKIPPED` without them. Set

@@ -25,8 +25,22 @@ pub enum ActiveState {
 pub struct ListedPackage {
     pub name: String,
     pub source: String,
+    /// What the declaration is, if it has a name at all.
+    pub identity: Option<PackageIdentity>,
     /// Present when the comparison with the active generation was requested.
     pub active: Option<ActiveState>,
+}
+
+impl ListedPackage {
+    /// The name that refers to this declaration and no other with the same attribute, or
+    /// `None` for an entry without a name, which cannot be asked for.
+    pub fn request_name(&self) -> Option<String> {
+        let identity = self.identity.as_ref()?;
+        Some(match identity.source {
+            PackageSource::Nixpkgs => format!("pkgs.{}", identity.attr),
+            _ => identity.qualified(),
+        })
+    }
 }
 
 /// Result of the listing.
@@ -60,6 +74,7 @@ impl ListPackages<'_> {
             .enumerate()
             .map(|(index, declaration)| ListedPackage {
                 name: display_name(declaration),
+                identity: declaration.identity.clone(),
                 source: declaration
                     .identity
                     .as_ref()
@@ -189,6 +204,28 @@ mod tests {
             ]
         );
         assert_eq!(fixture.catalog_calls(), 0);
+    }
+
+    #[test]
+    fn request_names_refer_to_one_declaration() {
+        let listed = list(&Fixture::new(LIST), false);
+        let name_of = |attr: &str, source: &str| {
+            listed
+                .packages
+                .iter()
+                .find(|package| package.name == attr && package.source == source)
+                .and_then(ListedPackage::request_name)
+        };
+        assert_eq!(
+            name_of("firefox", "nixpkgs").as_deref(),
+            Some("pkgs.firefox")
+        );
+        assert_eq!(
+            name_of("vscode", "unstable").as_deref(),
+            Some("unstable.vscode")
+        );
+        assert_eq!(name_of("tool", "tool").as_deref(), Some("tool"));
+        assert_eq!(name_of("\"text\"", "unknown"), None);
     }
 
     #[test]

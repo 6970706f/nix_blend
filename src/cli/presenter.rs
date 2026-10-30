@@ -344,6 +344,7 @@ mod tests {
         ListedPackage {
             name: name.to_owned(),
             source: source.to_owned(),
+            identity: None,
             active,
         }
     }

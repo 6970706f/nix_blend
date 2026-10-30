@@ -187,7 +187,8 @@ fn passwd_entries(passwd: &str) -> impl Iterator<Item = (&str, UserIdentity)> {
 /// This way the kernel itself prevents symlinks in the home directory from
 /// leading root to write outside it, and new files get the right owner from the
 /// start. The calls only affect the current thread, which is the one doing file
-/// access: other threads only read pipes or clean up temporary files. The groups are
+/// access, whichever thread runs the use cases: others only draw, read pipes or clean up
+/// temporary files. The groups are
 /// those of the user, since they are root's otherwise.
 pub struct PrivilegeGuard {
     restore: Option<(Uid, Gid, Vec<Gid>)>,

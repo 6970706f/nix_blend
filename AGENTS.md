@@ -13,7 +13,8 @@ Nixblend é um gerenciador de pacotes para NixOS com experiência de uso semelha
   - `application`: um módulo por caso de uso e `ports.rs` com as interfaces (traits) de que precisam; `application::error` tem os tipos de erro.
   - `infrastructure`: implementações das interfaces: ferramentas Nix, edição de arquivos `.nix`, gravação atômica, processos, sinais, configuração e privilégios.
   - `cli`: definição dos comandos e argumentos, apresentação, perguntas, mensagens e diff.
-  - `main.rs`: único ponto que conecta as camadas. As dependências apontam para dentro: `cli` → `application` → `domain`, e `infrastructure` implementa os ports.
+  - `tui`: interface interativa. Como `cli`, só apresenta: os casos de uso rodam em uma thread própria e conversam com ela pelo port `Interaction`.
+  - `main.rs`: único ponto que conecta as camadas. As dependências apontam para dentro: `cli` e `tui` → `application` → `domain`, e `infrastructure` implementa os ports.
 - Mantenha a lógica de negócio independente da interface de terminal sempre que isso não gerar complexidade desnecessária.
 - Defina interfaces pequenas entre módulos. Evite módulos que conheçam detalhes internos de todos os outros.
 - Não antecipe funcionalidades futuras sem requisito real; preserve pontos de extensão claros.
@@ -62,7 +63,7 @@ Nixblend é um gerenciador de pacotes para NixOS com experiência de uso semelha
 - Evite dependências pesadas quando a biblioteca padrão ou uma dependência pequena resolver o problema.
 - Não invoque `nix`, `nixos-rebuild` ou outros processos externos para tarefas que podem ser resolvidas localmente.
 - Não faça varreduras recursivas ou leituras repetidas do mesmo arquivo sem necessidade.
-- Mantenha o fluxo síncrono enquanto não houver uma necessidade concreta de concorrência. Threads existem apenas para ler pipes de processos e tratar sinais.
+- Mantenha o fluxo síncrono enquanto não houver uma necessidade concreta de concorrência. Threads existem apenas para ler pipes de processos, tratar sinais e manter os casos de uso fora do laço de desenho da TUI.
 
 ## Testes e qualidade
 

@@ -1,7 +1,7 @@
 //! Command line: receives arguments, calls use cases and presents their results.
 
 mod args;
-mod presenter;
+pub mod presenter;
 pub mod progress;
 pub mod terminal;
 
@@ -132,4 +132,12 @@ fn search(term: &str, services: Services) -> Result<(), AppError> {
             }
         }
     }
+}
+
+/// Explains why the interactive interface cannot open: there is no terminal to draw on.
+pub fn report_no_terminal() {
+    report("The interactive interface needs a terminal. Use a command instead, such as:");
+    report("  nixblend search <term>");
+    report("  nixblend list");
+    report("See 'nixblend --help' for all of them.");
 }
