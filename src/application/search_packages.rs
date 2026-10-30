@@ -28,6 +28,9 @@ impl SearchPackages<'_> {
     /// Having no results is a valid outcome; a failed search is an
     /// error, with the reason Nix reported.
     pub fn execute(&self, term: &str) -> Result<Option<SearchResults>, AppError> {
+        if term.trim().is_empty() {
+            return Err(AppError::EmptySearchTerm);
+        }
         let catalog = self
             .services
             .catalogs
@@ -40,8 +43,7 @@ impl SearchPackages<'_> {
             .unwrap_or_default();
         if !typos.is_empty() {
             self.services.ui.notify(&Notice::DidYouMean(typos))?;
-            let question = Question::RunFullSearch(term.to_owned());
-            if !self.services.ui.confirm(&question)? {
+            if !self.services.ui.confirm(&Question::SearchDespiteTypo)? {
                 return Ok(None);
             }
         }
@@ -53,27 +55,38 @@ impl SearchPackages<'_> {
         }))
     }
 
-    /// Completes `page` with the metadata a search does not report. If that fails,
-    /// the page is returned as it was, and its missing fields stay unknown.
-    pub fn with_details(&self, page: &[Package]) -> Vec<Package> {
+    /// Completes `page` with the metadata a search does not report. If that fails, the
+    /// page is returned as it was, with its missing fields unknown, and the reason.
+    pub fn with_details(&self, page: &[Package]) -> (Vec<Package>, Option<String>) {
         let attrs: Vec<String> = page
             .iter()
             .map(|package| package.identity.attr.clone())
             .collect();
-        let details = self
+        let queried = self
             .services
             .catalogs
             .catalog(&PackageSource::Nixpkgs)
-            .and_then(|catalog| catalog.metadata(&attrs))
-            .unwrap_or_default();
-        page.iter()
+            .and_then(|catalog| {
+                let details = catalog.metadata(&attrs)?;
+                Ok((details, catalog.warning()))
+            });
+        let (details, warning) = match queried {
+            Ok(result) => result,
+            Err(error) => (
+                Default::default(),
+                Some(format!("could not read package details: {error}")),
+            ),
+        };
+        let packages = page
+            .iter()
             .map(|package| {
                 details
                     .get(&package.identity.attr)
                     .cloned()
                     .unwrap_or_else(|| package.clone())
             })
-            .collect()
+            .collect();
+        (packages, warning)
     }
 }
 
@@ -89,6 +102,21 @@ mod tests {
         }
         .execute(term)
         .map(|results| results.expect("the search should have run"))
+    }
+
+    #[test]
+    fn an_empty_term_is_refused() {
+        let fixture = Fixture::new("[ ]");
+        let use_case = SearchPackages {
+            services: fixture.services(),
+        };
+        for term in ["", "  "] {
+            assert!(matches!(
+                use_case.execute(term),
+                Err(AppError::EmptySearchTerm)
+            ));
+        }
+        assert_eq!(fixture.searches(), 0);
     }
 
     #[test]
@@ -153,15 +181,16 @@ mod tests {
             services: fixture.services(),
         };
         let page = [package("foo")];
-        assert_eq!(
-            use_case.with_details(&page)[0].metadata.license.as_deref(),
-            Some("MIT")
-        );
+        let (detailed_page, warning) = use_case.with_details(&page);
+        assert_eq!(detailed_page[0].metadata.license.as_deref(), Some("MIT"));
+        assert_eq!(warning, None);
 
         let fixture = Fixture::new("[ ]").failing_catalog();
         let use_case = SearchPackages {
             services: fixture.services(),
         };
-        assert_eq!(use_case.with_details(&page), page);
+        let (same_page, warning) = use_case.with_details(&page);
+        assert_eq!(same_page, page);
+        assert!(warning.unwrap().contains("network down"));
     }
 }

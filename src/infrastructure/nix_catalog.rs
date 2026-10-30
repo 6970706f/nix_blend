@@ -5,6 +5,7 @@
 //! of attribute names evaluate just what they need, and results go through the Nix
 //! evaluation cache. Every query uses the revision locked by the system flake.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,6 +72,7 @@ impl CatalogProvider for NixCatalogs<'_> {
             }
         };
         Ok(Box::new(NixCatalog {
+            warning: RefCell::new(None),
             program: tools::program(NIX, self.elevated).map_err(SearchError::Failed)?,
             source: source.clone(),
             flake_ref,
@@ -85,6 +87,7 @@ impl CatalogProvider for NixCatalogs<'_> {
 
 /// `nix` commands against one flake reference.
 struct NixCatalog<'a> {
+    warning: RefCell<Option<String>>,
     program: PathBuf,
     source: PackageSource,
     flake_ref: String,
@@ -124,83 +127,86 @@ impl NixCatalog<'_> {
         })
     }
 
-    /// The package set evaluated for metadata: the one the system configuration really
-    /// uses, with its overlays and settings, when there is one.
-    fn package_set(&self) -> String {
-        match &self.system_flake {
-            Some(flake) => format!("{flake}#{SYSTEM_PKGS}"),
-            None => format!("{}#legacyPackages.{}", self.flake_ref, current_system()),
-        }
+    fn locked_package_set(&self) -> String {
+        format!("{}#legacyPackages.{}", self.flake_ref, current_system())
     }
 
-    fn evaluate(&self, expression: &str, label: &str) -> Result<Vec<u8>, SearchError> {
-        let package_set = self.package_set();
+    fn evaluate_on(
+        &self,
+        package_set: &str,
+        expression: &str,
+        label: &str,
+    ) -> Result<Vec<u8>, SearchError> {
         let command = self.command(&[
             "eval",
             "--json",
             "--no-write-lock-file",
-            &package_set,
+            package_set,
             "--apply",
             expression,
         ]);
         let output = self.run(command, label, QUERY_TIMEOUT)?;
         if !output.status.success() {
-            return Err(SearchError::Failed(error_message(&output.stderr)));
+            return Err(SearchError::Failed(process::failure_reason(&output)));
         }
         Ok(output.stdout)
     }
 
-    /// Without the system configuration, availability would reflect the default
-    /// settings of nixpkgs rather than the user's.
-    fn parse_metadata(&self, json: &[u8]) -> Result<BTreeMap<String, Package>, SearchError> {
-        parse_metadata(json, &self.source, self.system_flake.is_some())
-    }
-
-    /// Asks `nix search` about one attribute, without evaluating anything else.
-    fn scoped_search(&self, attr: &str) -> Result<Option<Package>, SearchError> {
-        let installable = format!("{}#{attr}", self.flake_ref);
-        let command = self.command(&["search", "--json", &installable, "^"]);
-        let output = self.run(command, "Checking nixpkgs", QUERY_TIMEOUT)?;
-        if !output.status.success() {
-            return Err(SearchError::Failed(error_message(&output.stderr)));
+    /// Evaluates against the package set the system configuration really uses, with its
+    /// overlays and settings. A configuration that cannot be evaluated right now, or has
+    /// another name, does not stop the query: the locked revision still answers it, and
+    /// the reason is kept for the user. Returns whether the configuration was used.
+    fn evaluate(&self, expression: &str, label: &str) -> Result<(Vec<u8>, bool), SearchError> {
+        if let Some(flake) = &self.system_flake {
+            let package_set = format!("{flake}#{SYSTEM_PKGS}");
+            match self.evaluate_on(&package_set, expression, label) {
+                Ok(json) => return Ok((json, true)),
+                Err(error @ SearchError::Failed(_)) if self.pinned => {
+                    *self.warning.borrow_mut() = Some(format!(
+                        "the system configuration could not be evaluated, so its overlays and settings were not considered: {error}"
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let results = parse_results(&output.stdout, &self.source)?;
-        Ok(results
-            .into_iter()
-            .find(|package| package.identity.attr == attr))
+        let json = self.evaluate_on(&self.locked_package_set(), expression, label)?;
+        Ok((json, false))
     }
 }
 
 impl PackageCatalog for NixCatalog<'_> {
     fn exact(&self, attr: &str) -> Result<Option<Package>, SearchError> {
-        match self.metadata(&[attr.to_owned()]) {
-            Ok(mut packages) => Ok(packages.remove(attr)),
-            // The evaluation can fail while the package exists, as with a configuration
-            // that is broken right now. If this also fails, nothing is known.
-            Err(evaluation_error) => self.scoped_search(attr).map_err(|_| evaluation_error),
-        }
+        let mut packages = self.metadata(&[attr.to_owned()])?;
+        Ok(packages.remove(attr))
     }
 
     fn names(&self) -> Result<Vec<String>, SearchError> {
-        let json = self.evaluate("builtins.attrNames", "Reading package names")?;
+        let (json, _) = self.evaluate("builtins.attrNames", "Reading package names")?;
         serde_json::from_slice(&json)
             .map_err(|error| SearchError::InvalidResponse(error.to_string()))
     }
 
     fn search(&self, term: &str) -> Result<Vec<Package>, SearchError> {
         let regex = escape_regex(term);
-        let command = self.command(&["search", "--json", &self.flake_ref, &regex]);
+        // After `--`, a term that looks like an option is still a term.
+        let command = self.command(&["search", "--json", &self.flake_ref, "--", &regex]);
         let output = self.run(command, "Searching nixpkgs", SEARCH_TIMEOUT)?;
         if !output.status.success() {
-            return Err(SearchError::Failed(error_message(&output.stderr)));
+            return Err(SearchError::Failed(process::failure_reason(&output)));
         }
         parse_results(&output.stdout, &self.source)
     }
 
     fn metadata(&self, attrs: &[String]) -> Result<BTreeMap<String, Package>, SearchError> {
         let expression = metadata_expression(attrs);
-        let json = self.evaluate(&expression, "Reading package details")?;
-        self.parse_metadata(&json)
+        let (json, from_system) = self.evaluate(&expression, "Reading package details")?;
+        // Without the system configuration, availability would reflect the default
+        // settings of nixpkgs rather than the user's.
+        parse_metadata(&json, &self.source, from_system)
+    }
+
+    fn warning(&self) -> Option<String> {
+        self.warning.borrow().clone()
     }
 
     fn is_pinned(&self) -> bool {
@@ -262,13 +268,6 @@ fn escape_regex(term: &str) -> String {
         escaped.push(character);
     }
     escaped
-}
-
-/// Keeps what Nix reported from its first error on, without the progress lines.
-fn error_message(stderr: &[u8]) -> String {
-    let stderr = String::from_utf8_lossy(stderr);
-    let start = stderr.find("error:").unwrap_or(0);
-    stderr[start..].trim().to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -450,6 +449,7 @@ mod tests {
 
     fn catalog(program: &str, system_flake: Option<&str>) -> NixCatalog<'static> {
         NixCatalog {
+            warning: RefCell::new(None),
             program: PathBuf::from(program),
             source: PackageSource::Nixpkgs,
             flake_ref: "github:NixOS/nixpkgs/abc".to_owned(),
@@ -571,13 +571,9 @@ mod tests {
     }
 
     #[test]
-    fn metadata_comes_from_the_system_configuration_when_there_is_one() {
+    fn locked_package_set_uses_the_locked_revision() {
         assert_eq!(
-            catalog("nix", Some("/etc/nixos")).package_set(),
-            "/etc/nixos#nixosConfigurations.nixos.pkgs"
-        );
-        assert_eq!(
-            catalog("nix", None).package_set(),
+            catalog("nix", None).locked_package_set(),
             format!(
                 "github:NixOS/nixpkgs/abc#legacyPackages.{}",
                 current_system()
@@ -586,17 +582,22 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_system_configuration_falls_back_and_says_so() {
+        let failing = catalog("false", Some("/etc/nixos"));
+        assert!(matches!(failing.names(), Err(SearchError::Failed(_))));
+        assert!(
+            failing
+                .warning()
+                .unwrap()
+                .contains("could not be evaluated")
+        );
+    }
+
+    #[test]
     fn escapes_regex_metacharacters() {
         assert_eq!(escape_regex("kdePackages.kate"), r"kdePackages\.kate");
         assert_eq!(escape_regex("yt-dlp"), "yt-dlp");
         assert_eq!(escape_regex("a+(b)"), r"a\+\(b\)");
-    }
-
-    #[test]
-    fn error_message_skips_progress_output() {
-        let stderr = b"evaluating 'x'...\nerror: unable to download 'y'\n";
-        assert_eq!(error_message(stderr), "error: unable to download 'y'");
-        assert_eq!(error_message(b" other \n"), "other");
     }
 
     #[test]

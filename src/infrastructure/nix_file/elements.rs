@@ -29,28 +29,59 @@ pub fn declarations(
 
 /// Index of the last token of the element starting at `first`. List elements are
 /// separated only by whitespace, so an element is a primary expression followed by
-/// attribute selections and an optional `or` fallback.
+/// attribute selections and any number of `or` fallbacks.
 fn element_end(tokens: Tokens, first: usize, close: usize) -> Option<usize> {
     let mut last = primary_end(tokens, first)?;
     loop {
         if tokens.is_punct(last + 1, b'.') && last + 2 < close {
             let segment = last + 2;
-            if tokens.tokens[segment].kind == TokenKind::Other && tokens.text(segment) == "$" {
+            if is_dollar(tokens, segment) {
                 last = tokens.matching_close(segment + 1).ok()?;
             } else {
                 last = segment;
             }
         } else if tokens.is_word(last + 1, "or") && last + 2 < close {
-            last = element_end(tokens, last + 2, close)?;
+            last = primary_end(tokens, last + 2)?;
         } else {
             return Some(last);
         }
     }
 }
 
+fn is_dollar(tokens: Tokens, index: usize) -> bool {
+    tokens
+        .tokens
+        .get(index)
+        .is_some_and(|token| token.kind == TokenKind::Other)
+        && tokens.text(index) == "$"
+}
+
+/// A primary expression. `rec { }` is one, and a path with interpolations is too, as
+/// its parts have no space between them: `./a${b}/c`.
 fn primary_end(tokens: Tokens, first: usize) -> Option<usize> {
-    match tokens.tokens.get(first)?.kind {
+    let token = tokens.tokens.get(first)?;
+    match token.kind {
         TokenKind::Punct(b'(' | b'[' | b'{') => tokens.matching_close(first).ok(),
+        TokenKind::Ident if tokens.is_word(first, "rec") => tokens.matching_close(first + 1).ok(),
+        TokenKind::Other => {
+            let mut last = first;
+            loop {
+                let end = tokens.tokens[last].end;
+                let adjacent = |index: usize| {
+                    tokens
+                        .tokens
+                        .get(index)
+                        .is_some_and(|next| next.start == end)
+                };
+                if is_dollar(tokens, last + 1) && adjacent(last + 1) {
+                    last = tokens.matching_close(last + 2).ok()?;
+                } else if adjacent(last + 1) && tokens.tokens[last + 1].kind == TokenKind::Other {
+                    last += 1;
+                } else {
+                    return Some(last);
+                }
+            }
+        }
         _ => Some(first),
     }
 }
@@ -66,7 +97,10 @@ fn classify(
     let (identity, kind) = if tokens.is_punct(first, b'(') {
         parenthesized(tokens, site, aliases, first)
     } else {
-        match tokens.dotted_path(first) {
+        match (!tokens.is_word(first, "rec"))
+            .then(|| tokens.dotted_path(first))
+            .flatten()
+        {
             Some((path, next)) => {
                 let kind = if next == last + 1 {
                     DeclarationKind::Plain

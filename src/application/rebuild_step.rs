@@ -18,8 +18,13 @@ pub fn run_after_edit(
     if let Err(error) = services.rebuilder.rebuild() {
         services.ui.notify(&Notice::RebuildFailed)?;
         if services.ui.confirm(&Question::UndoEdit)? {
-            file.replace(original)?;
-            services.ui.notify(&Notice::EditUndone)?;
+            // The rebuild failure stays the outcome of the command, whatever happens here.
+            match file.replace(original) {
+                Ok(()) => services.ui.notify(&Notice::EditUndone)?,
+                Err(undo_error) => services
+                    .ui
+                    .notify(&Notice::UndoFailed(undo_error.to_string()))?,
+            }
         }
         return Err(error.into());
     }

@@ -122,6 +122,10 @@ impl Lexer<'_> {
                 b'[' | b']' | b'(' | b')' | b';' | b':' | b'@' => {
                     self.single(TokenKind::Punct(byte));
                 }
+                b'<' if self.search_path_length().is_some() => {
+                    let length = self.search_path_length().unwrap_or(1);
+                    self.operator(length);
+                }
                 b'=' | b'!' | b'<' | b'>' if self.peek(1) == Some(b'=') => self.operator(2),
                 b'=' => self.single(TokenKind::Punct(byte)),
                 b'.' => self.dot(),
@@ -138,6 +142,21 @@ impl Lexer<'_> {
             return Err("unterminated interpolation");
         }
         Ok(())
+    }
+
+    /// Length of a search path such as `<nixpkgs/lib>` at the current position.
+    fn search_path_length(&self) -> Option<usize> {
+        let mut length = 1;
+        while let Some(byte) = self.peek(length) {
+            if byte == b'>' {
+                return (length > 1).then_some(length + 1);
+            }
+            if !is_path_char(byte) && byte != b'/' {
+                return None;
+            }
+            length += 1;
+        }
+        None
     }
 
     fn operator(&mut self, length: usize) {
@@ -324,6 +343,16 @@ mod tests {
         assert_eq!(texts("./a/b.nix c"), ["./a/b.nix", "c"]);
         assert_eq!(texts("https://x.y/*z c"), ["https://x.y/*z", "c"]);
         assert_eq!(texts("a/b c"), ["a/b", "c"]);
+    }
+
+    #[test]
+    fn search_paths_are_one_token() {
+        assert_eq!(
+            texts("[ <nixpkgs> <a/b.c> ]"),
+            ["[", "<nixpkgs>", "<a/b.c>", "]"]
+        );
+        assert_eq!(texts("a < b"), ["a", "<", "b"]);
+        assert_eq!(texts("a <= b"), ["a", "<=", "b"]);
     }
 
     #[test]

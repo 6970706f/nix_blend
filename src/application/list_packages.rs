@@ -34,6 +34,8 @@ pub struct ListedPackage {
 pub struct PackageList {
     pub path: PathBuf,
     pub packages: Vec<ListedPackage>,
+    /// Why the comparison with the active generation is less exact than it could be.
+    pub warning: Option<String>,
 }
 
 /// Reads the declarations of the managed file.
@@ -47,10 +49,11 @@ impl ListPackages<'_> {
         let managed = managed::open_for_reading(self.services)?;
         let declarations = unique_declarations(&managed.declared.declarations);
 
-        let active = if compare_active {
-            Some(self.active_states(&declarations)?)
+        let (active, warning) = if compare_active {
+            let (states, warning) = self.active_states(&declarations)?;
+            (Some(states), warning)
         } else {
-            None
+            (None, None)
         };
         let packages = declarations
             .iter()
@@ -70,6 +73,7 @@ impl ListPackages<'_> {
         Ok(PackageList {
             path: managed.file.path().to_owned(),
             packages,
+            warning,
         })
     }
 
@@ -79,7 +83,7 @@ impl ListPackages<'_> {
     fn active_states(
         &self,
         declarations: &[&PackageDeclaration],
-    ) -> Result<Vec<ActiveState>, AppError> {
+    ) -> Result<(Vec<ActiveState>, Option<String>), AppError> {
         let store_names = self.services.generation.store_names()?;
         let attrs: Vec<String> = declarations
             .iter()
@@ -87,14 +91,23 @@ impl ListPackages<'_> {
             .filter(|identity| identity.source == PackageSource::Nixpkgs)
             .map(|identity| identity.attr.clone())
             .collect();
-        let metadata = self
+        let queried = self
             .services
             .catalogs
             .catalog(&PackageSource::Nixpkgs)
-            .and_then(|catalog| catalog.metadata(&attrs))
-            .unwrap_or_default();
+            .and_then(|catalog| {
+                let metadata = catalog.metadata(&attrs)?;
+                Ok((metadata, catalog.warning()))
+            });
+        let (metadata, warning) = match queried {
+            Ok(result) => result,
+            Err(error) => (
+                Default::default(),
+                Some(format!("could not read package details: {error}")),
+            ),
+        };
 
-        Ok(declarations
+        let states = declarations
             .iter()
             .map(|declaration| {
                 let Some(identity) = &declaration.identity else {
@@ -111,7 +124,8 @@ impl ListPackages<'_> {
                     None => ActiveState::Unknown,
                 }
             })
-            .collect())
+            .collect();
+        Ok((states, warning))
     }
 }
 
@@ -189,6 +203,15 @@ mod tests {
             error,
             AppError::Config(ConfigError::NotConfigured)
         ));
+    }
+
+    #[test]
+    fn a_failed_comparison_says_why() {
+        let fixture = Fixture::new(LIST)
+            .failing_catalog()
+            .with_store_names(&["git-1"]);
+        let listed = list(&fixture, true);
+        assert!(listed.warning.unwrap().contains("network down"));
     }
 
     #[test]

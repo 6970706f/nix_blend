@@ -79,6 +79,10 @@ pub fn notice(notice: &Notice) -> String {
         Notice::RebuildDone => "Rebuild: done.".to_owned(),
         Notice::RebuildFailed => "Rebuild: failed.".to_owned(),
         Notice::EditUndone => "Edit: the file is back to its previous content.".to_owned(),
+        Notice::UndoFailed(reason) => {
+            format!("Edit: could not undo, so the edit is still applied: {reason}")
+        }
+        Notice::Warning(warning) => format!("Warning: {warning}"),
     }
 }
 
@@ -98,6 +102,7 @@ pub fn question(question: &Question) -> String {
         Question::RunFullSearch(package) => format!(
             "Search all package names and descriptions for '{package}'? The first search of a nixpkgs revision takes about a minute and several GB of memory."
         ),
+        Question::SearchDespiteTypo => "Search for it anyway?".to_owned(),
         Question::UndoEdit => "Undo the edit?".to_owned(),
     }
 }
@@ -126,8 +131,15 @@ pub fn one_line(package: &Package) -> String {
     ))
 }
 
-/// Package data comes from outside the program, so control characters are removed
-/// before it reaches the terminal.
+/// Text from files and tools comes from outside the program. Control characters could
+/// rewrite what the terminal shows, so only line breaks and tabs get through.
+pub fn sanitize(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
+}
+
+/// Like [`sanitize`], for what must stay on one line.
 fn clean(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
 }
@@ -195,9 +207,12 @@ pub fn package_info(info: &PackageInfo) -> String {
     let declared = match &info.declared {
         DeclaredState::Yes(declarations) => format!("Yes ({})", declarations.join(", ")),
         DeclaredState::No => "No".to_owned(),
-        DeclaredState::Unknown => format!("{UNKNOWN} (no readable managed file)"),
+        DeclaredState::Unknown(reason) => format!("{UNKNOWN} ({reason})"),
     };
     field(&mut output, "Declared", Some(&declared));
+    if let Some(warning) = &info.warning {
+        field(&mut output, "Warning", Some(warning));
+    }
     output
 }
 
@@ -253,6 +268,9 @@ pub fn package_list(list: &PackageList) -> String {
                 let _ = writeln!(output, "{:name_width$}  {}", package.name, package.source);
             }
         }
+    }
+    if let Some(warning) = &list.warning {
+        let _ = writeln!(output, "Warning: {warning}");
     }
     output
 }
@@ -338,6 +356,7 @@ mod tests {
                 metadata: PackageMetadata::default(),
             },
             declared: DeclaredState::No,
+            warning: None,
         };
         let text = package_info(&info);
         for line in [
@@ -371,12 +390,14 @@ mod tests {
                 },
             },
             declared: DeclaredState::Yes(vec!["firefox".to_owned()]),
+            warning: Some("partial".to_owned()),
         };
         let text = package_info(&info);
         assert!(text.contains("License: MPL-2.0"));
         assert!(text.contains("Status: Refused: unfree"));
         assert!(text.contains("Unfree: Yes"));
         assert!(text.contains("Declared: Yes (firefox)"));
+        assert!(text.contains("Warning: partial"));
     }
 
     #[test]
@@ -400,6 +421,7 @@ mod tests {
                 listed("firefox", "nixpkgs", None),
                 listed("vscode", "unstable", None),
             ],
+            warning: None,
         };
         assert_eq!(
             package_list(&list),
@@ -416,6 +438,7 @@ mod tests {
                 listed("vim", "nixpkgs", Some(ActiveState::NotActive)),
                 listed("x", "tool", Some(ActiveState::Unknown)),
             ],
+            warning: None,
         };
         let text = package_list(&list);
         assert!(text.contains("PACKAGE  SOURCE   ACTIVE"), "{text}");
@@ -429,6 +452,7 @@ mod tests {
         let list = PackageList {
             path: PathBuf::from("/p.nix"),
             packages: Vec::new(),
+            warning: None,
         };
         assert!(package_list(&list).contains("No packages are declared."));
     }

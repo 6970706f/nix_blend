@@ -89,6 +89,8 @@ pub trait PackageCatalog {
     fn metadata(&self, attrs: &[String]) -> Result<BTreeMap<String, Package>, SearchError>;
     /// Whether results are from the revision locked by the system's configuration.
     fn is_pinned(&self) -> bool;
+    /// Something that made the answers less complete, though they are still valid.
+    fn warning(&self) -> Option<String>;
 }
 
 /// Gives access to the catalog of each source.
@@ -169,6 +171,10 @@ pub enum Notice {
     RebuildFailed,
     /// The file is back to its previous content.
     EditUndone,
+    /// Going back failed, so the edit is still applied.
+    UndoFailed(String),
+    /// Something the user should know, though the operation goes on.
+    Warning(String),
 }
 
 /// A decision only the user can make.
@@ -185,6 +191,10 @@ pub enum Question {
     },
     /// Nothing close was found: search names and descriptions, which can be slow.
     RunFullSearch(String),
+    /// The term looks like a typo, but it may be meant. Unlike the others, this
+    /// question defaults to yes, because going on changes nothing and refusing to search
+    /// for what was asked would be wrong.
+    SearchDespiteTypo,
     /// The rebuild failed: go back to the previous content of the file.
     UndoEdit,
 }
@@ -195,6 +205,8 @@ pub enum Choice {
     /// Zero-based index of the chosen option.
     Index(usize),
     More,
+    /// Search all package names and descriptions instead.
+    SearchAll,
     Cancel,
 }
 
@@ -207,13 +219,14 @@ pub trait Interaction {
     /// Asks for the path of the file to manage.
     fn ask_packages_path(&self) -> io::Result<Option<String>>;
     /// Shows `page`, numbered from `first_index`, and asks for a choice among all
-    /// options shown so far.
+    /// options shown so far. `offer_search` adds the option of a full search.
     fn choose_package(
         &self,
         requested: &str,
         page: &[Package],
         first_index: usize,
         has_more: bool,
+        offer_search: bool,
     ) -> io::Result<Choice>;
 }
 

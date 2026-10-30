@@ -36,7 +36,7 @@ fn main() -> ExitCode {
     let identity = match user::current() {
         Ok(identity) => identity,
         Err(error) => {
-            eprintln!("{}", AppError::from(error));
+            cli::report(&AppError::from(error).to_string());
             return ExitCode::FAILURE;
         }
     };

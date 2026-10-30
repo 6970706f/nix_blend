@@ -787,7 +787,10 @@ fn broken_current_file_is_not_edited() {
 fn interruption_leaves_no_temporary_file() {
     let sandbox = Sandbox::new();
     sandbox.write_config();
-    sandbox.tool("nix-instantiate", "sleep 30");
+    sandbox.tool(
+        "nix-instantiate",
+        &format!("{} 30", which("sleep").display()),
+    );
 
     let mut child = {
         let _lock = SPAWN_LOCK.lock().unwrap();
@@ -1138,4 +1141,294 @@ fn search_for_a_likely_typo_needs_consent() {
     let text = stdout(&output);
     assert!(text.contains("Did you mean: firefox?"), "{text}");
     assert!(text.contains("Search not run"), "{text}");
+}
+
+fn spawn_with_null_input(sandbox: &Sandbox, arguments: &[&str]) -> std::process::Child {
+    let _lock = SPAWN_LOCK.lock().unwrap();
+    Command::new(env!("CARGO_BIN_EXE_nixblend"))
+        .args(arguments)
+        .env("PATH", sandbox.bin())
+        .env("XDG_DATA_HOME", sandbox.data_home())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn closed_pipe_ends_quietly_instead_of_panicking() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config();
+    // The tool waits, so that the reader is already gone when results are written.
+    sandbox.tool(
+        "nix",
+        &format!(
+            r#"{} 0.3; case "$*" in
+  *attrNames*) echo '[]';;
+  *" eval "*) echo '{{}}';;
+  *) echo '{{"legacyPackages.x.foo":{{"pname":"foo","version":"1"}}}}';;
+esac"#,
+            which("sleep").display()
+        ),
+    );
+
+    let mut child = spawn_with_null_input(&sandbox, &["search", "foo"]);
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(141), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("panicked"), "{}", stderr(&output));
+}
+
+#[test]
+fn being_terminated_ends_the_running_tool() {
+    let sandbox = Sandbox::new();
+    let marker = sandbox.root.path().join("tool.pid");
+    sandbox.tool(
+        "nix",
+        &format!(
+            r#"case "$*" in
+  *attrNames*) echo '[]';;
+  *) echo $$ > '{}'; {} 60 & wait;;
+esac"#,
+            marker.display(),
+            which("sleep").display()
+        ),
+    );
+
+    let mut child = spawn_with_null_input(&sandbox, &["search", "foo"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while fs::read_to_string(&marker).map_or(true, |pid| pid.trim().is_empty()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tool did not start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let tool = fs::read_to_string(&marker).unwrap();
+    let tool_dir = PathBuf::from("/proc").join(tool.trim());
+
+    let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+    child.wait().unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tool_dir.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tool is still running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_killed_tool_gives_a_reason() {
+    let sandbox = Sandbox::new();
+    sandbox.tool("nix", "kill -9 $$");
+
+    let output = sandbox.command(&["search", "foo"], "");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("run out of memory"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_killed_validator_is_not_an_invalid_expression() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config();
+    sandbox.tool("nix-instantiate", "kill -9 $$");
+
+    let output = sandbox.run("foo", "y\n");
+
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(
+        error.contains("could not run the Nix validation"),
+        "{error}"
+    );
+    assert!(!error.contains("not valid Nix"), "{error}");
+}
+
+#[test]
+fn a_term_that_looks_like_an_option_is_still_a_term() {
+    let sandbox = Sandbox::new();
+    let log = sandbox.log();
+    sandbox.tool(
+        "nix",
+        &format!(
+            r#"case "$*" in
+  *attrNames*) echo '[]';;
+  *" search "*) echo "$*" >> '{}'; echo '{{}}';;
+  *) echo '{{}}';;
+esac"#,
+            log.display()
+        ),
+    );
+
+    let output = sandbox.command(&["search", "--", "--version"], "");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        sandbox.commands().ends_with(" -- --version\n"),
+        "{}",
+        sandbox.commands()
+    );
+}
+
+#[test]
+fn an_empty_search_term_is_refused() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.command(&["search", ""], "");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("empty"));
+}
+
+#[test]
+fn legitimate_words_search_without_a_question() {
+    let sandbox = Sandbox::new();
+    sandbox.tool(
+        "nix",
+        &nix_answering(
+            r#"["browsers","cbrowser","p0f","pdd"]"#,
+            "{}",
+            r#"{"legacyPackages.x.w3m":{"pname":"w3m","version":"1","description":"A browser"}}"#,
+        ),
+    );
+
+    for term in ["browser", "pdf"] {
+        let output = sandbox.command(&["search", term], "");
+        let text = stdout(&output);
+        assert!(!text.contains("Did you mean"), "{text}");
+        assert!(text.contains("Attribute: w3m"), "{text}");
+    }
+}
+
+#[test]
+fn likely_typo_searches_unless_told_not_to() {
+    let sandbox = Sandbox::new();
+    sandbox.tool(
+        "nix",
+        &nix_answering(
+            r#"["firefox"]"#,
+            "{}",
+            r#"{"legacyPackages.x.firefox":{"pname":"firefox","version":"1"}}"#,
+        ),
+    );
+
+    let output = sandbox.command(&["search", "firefx"], "");
+
+    let text = stdout(&output);
+    assert!(text.contains("Did you mean: firefox"), "{text}");
+    assert!(text.contains("Attribute: firefox"), "{text}");
+}
+
+#[test]
+fn nested_package_is_reachable_when_similar_names_are_offered() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config();
+    sandbox.tool(
+        "nix",
+        &nix_answering(
+            r#"["gate"]"#,
+            r#"{"gate":{"pname":"gate","version":"1","description":"Proxy","available":true}}"#,
+            r#"{"legacyPackages.x.kdePackages.kate":{"pname":"kate","version":"26","description":"Editor"}}"#,
+        ),
+    );
+
+    let output = sandbox.run("kate", "s\ny\nn\n");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("1) gate"), "{text}");
+    assert!(text.contains("s to search everything"), "{text}");
+    assert!(sandbox.content().contains("    kdePackages.kate\n"));
+}
+
+#[test]
+fn attribute_from_a_search_cannot_inject_code() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config();
+    sandbox.tool(
+        "nix",
+        &nix_answering(
+            "[]",
+            "{}",
+            r#"{"legacyPackages.x.evil ] ++ [ pkgs.foo":{"pname":"foo","version":"1"}}"#,
+        ),
+    );
+
+    let output = sandbox.run("foo", "y\ny\nn\n");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("was not found"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(sandbox.content(), MODULE);
+}
+
+#[test]
+fn failed_undo_still_reports_the_failed_rebuild() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config();
+    sandbox.tool(
+        "sudo",
+        &format!(
+            "echo '# changed' >> '{}'\nexit 7",
+            sandbox.packages().display()
+        ),
+    );
+
+    let output = sandbox.run("foo", "y\ny\ny\n");
+
+    assert_eq!(output.status.code(), Some(3));
+    let text = stdout(&output);
+    assert!(text.contains("could not undo"), "{text}");
+    assert!(stderr(&output).contains("rebuild error"));
+    assert!(sandbox.content().contains("    foo\n"));
+}
+
+#[test]
+fn control_characters_in_the_file_do_not_reach_the_terminal() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config();
+    sandbox.write_packages("{ pkgs }: [\n  \"\x1b[31mred\"\n  pkgs.git\n]\n");
+
+    let output = sandbox.command(&["list"], "");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!output.stdout.contains(&0x1b));
+    assert!(stdout(&output).contains("[31mred"));
+}
+
+#[test]
+fn info_explains_why_declaration_is_unknown() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.config().parent().unwrap()).unwrap();
+    fs::write(sandbox.config(), "packages_file = [").unwrap();
+
+    let output = sandbox.command(&["info", "foo"], "");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("Declared: Unknown (config error:"), "{text}");
+}
+
+#[test]
+fn group_writable_config_is_not_trusted() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config();
+    fs::set_permissions(sandbox.config(), fs::Permissions::from_mode(0o660)).unwrap();
+
+    let output = sandbox.command(&["list"], "");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("writable by group"));
 }

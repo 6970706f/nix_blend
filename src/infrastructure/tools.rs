@@ -1,8 +1,9 @@
 //! Execution environment of external tools.
 //!
 //! While elevated, the caller's environment must not decide what runs as root, so tools
-//! come from the current system profile, are checked before use, and do not inherit
-//! variables that change how they load code or read their settings.
+//! come from the current system profile, are checked before use, and only inherit
+//! variables known to be harmless. Too many variables change how some tool loads code
+//! or reads its settings for a list of the dangerous ones to be complete.
 
 use std::env;
 use std::fs;
@@ -16,7 +17,28 @@ use super::user::UserIdentity;
 
 const TRUSTED_BIN: &str = "/run/current-system/sw/bin";
 const TRUSTED_PATH: &str = "/run/wrappers/bin:/run/current-system/sw/bin";
-const UNTRUSTED_VARIABLE_PREFIXES: [&str; 2] = ["LD_", "NIX_"];
+const ROOT_HOME: &str = "/root";
+const INHERITED_VARIABLES: [&str; 18] = [
+    "COLORTERM",
+    "LANG",
+    "LANGUAGE",
+    "LOCALE_ARCHIVE",
+    "NO_COLOR",
+    "SSH_AUTH_SOCK",
+    "SUDO_GID",
+    "SUDO_UID",
+    "SUDO_USER",
+    "TERM",
+    "TERMINFO_DIRS",
+    "TZ",
+    "all_proxy",
+    "ftp_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "rsync_proxy",
+];
+const INHERITED_PREFIX: &str = "LC_";
 
 /// Program to execute for `name`: resolved through `PATH` normally. When elevated, it
 /// comes from the system profile and must be owned by root and not writable by others.
@@ -46,23 +68,28 @@ fn is_trusted(metadata: &fs::Metadata) -> bool {
 /// by root.
 pub fn apply_environment(command: &mut Command, elevated: bool, run_as: Option<&UserIdentity>) {
     if elevated {
-        command.env("PATH", TRUSTED_PATH);
-        for (name, _) in env::vars_os() {
-            let is_untrusted = name.to_str().is_none_or(|name| {
-                UNTRUSTED_VARIABLE_PREFIXES
-                    .iter()
-                    .any(|prefix| name.starts_with(prefix))
+        command.env_clear();
+        for (name, value) in env::vars_os() {
+            let inherited = name.to_str().is_some_and(|name| {
+                INHERITED_VARIABLES.contains(&name) || name.starts_with(INHERITED_PREFIX)
             });
-            if is_untrusted {
-                command.env_remove(&name);
+            if inherited {
+                command.env(name, value);
             }
         }
+        command
+            .env("PATH", TRUSTED_PATH)
+            .env("HOME", ROOT_HOME)
+            .env("USER", "root")
+            .env("LOGNAME", "root");
     }
     if let Some(user) = run_as {
         command
             .uid(user.uid)
             .gid(user.gid)
             .env("HOME", &user.home)
+            .env("USER", &user.name)
+            .env("LOGNAME", &user.name)
             .env_remove("XDG_CACHE_HOME");
     }
 }

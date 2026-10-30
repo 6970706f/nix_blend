@@ -11,8 +11,8 @@ use crate::domain::resolution::{DeclarationMatch, PackageRequest, find_declarati
 pub enum DeclaredState {
     Yes(Vec<String>),
     No,
-    /// There is no managed file to look at, or it could not be read.
-    Unknown,
+    /// There is no managed file to look at, or it could not be read, for this reason.
+    Unknown(String),
 }
 
 /// Result of the query.
@@ -20,6 +20,8 @@ pub enum DeclaredState {
 pub struct PackageInfo {
     pub package: Package,
     pub declared: DeclaredState,
+    /// Something that made the metadata less complete.
+    pub warning: Option<String>,
 }
 
 /// Queries the metadata of a package.
@@ -32,21 +34,27 @@ impl GetPackageInfo<'_> {
     pub fn execute(&self, name: &str) -> Result<PackageInfo, AppError> {
         let services = self.services;
         let name = PackageName::parse(name)?;
-        let managed = managed::open_for_reading(services).ok();
+        // The package can be described without the file, but the reason must not be lost.
+        let managed = managed::open_for_reading(services);
         let aliases: &[ChannelAlias] = managed
             .as_ref()
             .map_or(&[], |managed| &managed.declared.aliases);
         let request = PackageRequest::resolve(&name, aliases);
 
-        let package = services
-            .catalogs
-            .catalog(&request.identity.source)?
+        let catalog = services.catalogs.catalog(&request.identity.source)?;
+        let package = catalog
             .exact(&request.identity.attr)?
             .ok_or_else(|| AppError::PackageNotFound(request.identity.qualified()))?;
+        let mut warning = catalog.warning();
+        if !catalog.is_pinned() {
+            warning.get_or_insert_with(|| {
+                "could not read the nixpkgs revision from the system flake.lock; using the flake registry".to_owned()
+            });
+        }
 
         let declared = match &managed {
-            None => DeclaredState::Unknown,
-            Some(managed) => match find_declaration(&managed.declared.declarations, &request) {
+            Err(error) => DeclaredState::Unknown(error.to_string()),
+            Ok(managed) => match find_declaration(&managed.declared.declarations, &request) {
                 DeclarationMatch::None { .. } => DeclaredState::No,
                 DeclarationMatch::One(declaration) => {
                     DeclaredState::Yes(vec![declaration.text.clone()])
@@ -59,7 +67,11 @@ impl GetPackageInfo<'_> {
                 ),
             },
         };
-        Ok(PackageInfo { package, declared })
+        Ok(PackageInfo {
+            package,
+            declared,
+            warning,
+        })
     }
 }
 
@@ -91,10 +103,10 @@ mod tests {
     #[test]
     fn works_without_a_configuration() {
         let fixture = Fixture::new(LIST).with_package("git").without_config();
-        assert_eq!(
+        assert!(matches!(
             info(&fixture, "git").unwrap().declared,
-            DeclaredState::Unknown
-        );
+            DeclaredState::Unknown(reason) if reason.contains("no managed file")
+        ));
     }
 
     #[test]

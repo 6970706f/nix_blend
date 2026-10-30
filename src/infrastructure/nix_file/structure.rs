@@ -277,6 +277,12 @@ fn locate_attribute(tokens: Tokens) -> Result<ListSite, EditError> {
 /// Attribute path of the set opened at `open`, if it belongs to the module's top
 /// level. A set passed as an argument, as in `lib.mkIf x { ... }`, does not.
 fn set_prefix(tokens: Tokens, frames: &[Frame], open: usize) -> Option<String> {
+    // `rec { }` is a set like any other, for where it may appear.
+    let open = if open > 0 && tokens.is_word(open - 1, "rec") {
+        open - 1
+    } else {
+        open
+    };
     let Some(parent) = frames.last() else {
         let is_body = open == 0
             || tokens.is_punct(open - 1, b':')

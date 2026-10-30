@@ -7,9 +7,10 @@ pub mod terminal;
 
 pub use args::{Cli, Command};
 
+use std::io::{self, Write};
 use std::process::ExitCode;
 
-use crate::application::error::{AppError, ConfigError};
+use crate::application::error::AppError;
 use crate::application::get_package_info::GetPackageInfo;
 use crate::application::install_package::InstallPackage;
 use crate::application::list_packages::ListPackages;
@@ -20,16 +21,34 @@ use crate::application::search_packages::SearchPackages;
 
 /// Options shown at once in search results.
 const SEARCH_PAGE: usize = 20;
+/// Exit code of a program ended by a closed pipe, as a shell would report it.
+const PIPE_CLOSED: u8 = 141;
 
 /// Runs a command with the given services and returns the process exit code.
 pub fn run(command: &Command, services: Services) -> ExitCode {
     match dispatch(command, services) {
         Ok(()) => ExitCode::SUCCESS,
+        // Whoever was reading is gone, as in `nixblend search foo | head`, so this is the
+        // conventional end of such a program, with nobody to tell.
+        Err(AppError::Terminal(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
+            ExitCode::from(PIPE_CLOSED)
+        }
         Err(error) => {
-            eprintln!("{error}");
+            report(&error.to_string());
             exit_code(&error)
         }
     }
+}
+
+/// Writes to the standard error. If it is closed, there is nowhere left to complain to.
+pub fn report(message: &str) {
+    let _ = writeln!(io::stderr(), "{}", presenter::sanitize(message));
+}
+
+fn show(text: &str) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    stdout.write_all(presenter::sanitize(text).as_bytes())?;
+    stdout.flush()
 }
 
 /// The rebuild has its own code so that scripts can tell an applied edit from an edit
@@ -54,12 +73,12 @@ fn dispatch(command: &Command, services: Services) -> Result<(), AppError> {
         Command::Reinstall { package } => ReinstallPackage { services }.execute(package),
         Command::List { active } => {
             let list = ListPackages { services }.execute(*active)?;
-            print!("{}", presenter::package_list(&list));
+            show(&presenter::package_list(&list))?;
             Ok(())
         }
         Command::Info { package } => {
             let info = GetPackageInfo { services }.execute(package)?;
-            print!("{}", presenter::package_info(&info));
+            show(&presenter::package_info(&info))?;
             Ok(())
         }
         Command::Search { term } => search(term, services),
@@ -70,42 +89,46 @@ fn dispatch(command: &Command, services: Services) -> Result<(), AppError> {
 fn search(term: &str, services: Services) -> Result<(), AppError> {
     let use_case = SearchPackages { services };
     let Some(results) = use_case.execute(term)? else {
-        println!("Search not run. Try one of the names above.");
+        show("Search not run. Try one of the names above.\n")?;
         return Ok(());
     };
     if results.packages.is_empty() {
-        println!("No packages found for '{term}'.");
+        show(&format!("No packages found for '{term}'.\n"))?;
         return Ok(());
     }
     if !results.pinned {
-        eprintln!(
-            "Warning: could not read the nixpkgs revision from the system flake.lock; using the flake registry."
+        report(
+            "Warning: could not read the nixpkgs revision from the system flake.lock; using the flake registry.",
         );
     }
 
     let mut shown = 0;
     loop {
         let end = results.packages.len().min(shown + SEARCH_PAGE);
-        let page = use_case.with_details(&results.packages[shown..end]);
+        let (page, warning) = use_case.with_details(&results.packages[shown..end]);
+        if let Some(warning) = warning {
+            report(&format!("Warning: {warning}"));
+        }
         for package in &page {
-            println!("{}", presenter::search_result(package));
+            show(&format!("{}\n", presenter::search_result(package)))?;
         }
         shown = end;
         let has_more = shown < results.packages.len();
-        println!("Showing {shown} of {} result(s).", results.packages.len());
+        show(&format!(
+            "Showing {shown} of {} result(s).\n",
+            results.packages.len()
+        ))?;
 
-        let choice = services.ui.choose_package(term, &[], shown, has_more)?;
+        let choice = services
+            .ui
+            .choose_package(term, &[], shown, has_more, false)?;
         match choice {
             Choice::More => {}
-            Choice::Cancel => return Ok(()),
+            Choice::Cancel | Choice::SearchAll => return Ok(()),
             Choice::Index(index) => {
                 let attr = &results.packages[index].identity.attr;
-                match (GetPackageInfo { services }).execute(attr) {
-                    Ok(info) => print!("{}", presenter::package_info(&info)),
-                    Err(AppError::Config(ConfigError::NotConfigured)) => {}
-                    Err(error) => eprintln!("{error}"),
-                }
-                return Ok(());
+                let info = GetPackageInfo { services }.execute(attr)?;
+                return show(&presenter::package_info(&info)).map_err(AppError::from);
             }
         }
     }

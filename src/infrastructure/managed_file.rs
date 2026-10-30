@@ -132,8 +132,14 @@ fn read_file(
     if !name.ends_with(NIX_EXTENSION) {
         return Err(EditError::NotNixFile(resolved));
     }
-    if root_scope.is_some() && metadata.mode() & 0o002 != 0 {
-        return Err(EditError::UnsafePermissions(resolved));
+    if root_scope.is_some() {
+        if metadata.mode() & 0o002 != 0 {
+            return Err(EditError::UnsafePermissions(resolved));
+        }
+        // A link made elsewhere could bring in a file whose real name is not in scope.
+        if metadata.nlink() > 1 {
+            return Err(EditError::HardLinked(resolved));
+        }
     }
     let content = String::from_utf8(bytes).map_err(|_| EditError::NotUtf8(resolved.clone()))?;
 
@@ -190,7 +196,13 @@ impl OpenedFile {
         let staged = self.stage(new_content)?;
         let changed = || EditError::ChangedOnDisk(self.path.clone());
         let (bytes, metadata) = self.dir.read_file(&self.name).map_err(|_| changed())?;
-        if identity_of(&metadata) != self.identity || bytes != self.content.as_bytes() {
+        let attributes = attributes_of(&metadata);
+        let same_attributes =
+            attributes.mode == self.attributes.mode && attributes.owner == self.attributes.owner;
+        if identity_of(&metadata) != self.identity
+            || !same_attributes
+            || bytes != self.content.as_bytes()
+        {
             return Err(changed());
         }
         staged.commit().map_err(|source| self.io_error(source))?;
@@ -414,6 +426,37 @@ mod tests {
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), "edited elsewhere");
         assert_eq!(entries(directory.path()), 1);
+    }
+
+    #[test]
+    fn changed_permissions_are_not_reverted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("packages.nix");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let mut file = open(&path, FileMode::ReadWrite).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(matches!(
+            file.replace("new"),
+            Err(EditError::ChangedOnDisk(_))
+        ));
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+    }
+
+    #[test]
+    fn root_scope_refuses_hard_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("a.nix");
+        fs::write(&file, "").unwrap();
+        fs::hard_link(&file, directory.path().join("elsewhere")).unwrap();
+        assert!(matches!(
+            read_file(&file, FileMode::ReadOnly, Some(directory.path())),
+            Err(EditError::HardLinked(_))
+        ));
+        assert!(read_file(&file, FileMode::ReadOnly, None).is_ok());
     }
 
     #[test]

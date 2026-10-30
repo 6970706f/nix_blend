@@ -33,7 +33,7 @@ pub struct UserConfigStore {
 impl ConfigStore for UserConfigStore {
     fn load(&self) -> Result<Option<Config>, AppError> {
         let _guard = user::drop_privileges(&self.user)?;
-        Ok(load(&self.path, self.user.uid)?)
+        Ok(load(&self.path, self.user.uid, &self.user.home)?)
     }
 
     fn save(&self, config: &Config) -> Result<(), AppError> {
@@ -68,8 +68,8 @@ pub fn file_path(home: &Path, xdg_data_home: Option<&OsStr>, elevated: bool) -> 
 }
 
 /// Loads the configuration. Returns `None` if it does not exist yet. A file another user
-/// could have written is not trusted to say which file to manage.
-fn load(path: &Path, owner: u32) -> Result<Option<Config>, ConfigError> {
+/// could have written or replaced is not trusted to say which file to manage.
+fn load(path: &Path, owner: u32, home: &Path) -> Result<Option<Config>, ConfigError> {
     let read_error = |source| ConfigError::Read {
         path: path.to_owned(),
         source,
@@ -84,9 +84,15 @@ fn load(path: &Path, owner: u32) -> Result<Option<Config>, ConfigError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(read_error(source)),
     };
-    if metadata.uid() != owner || metadata.mode() & 0o002 != 0 {
+    if !is_private(&metadata, owner) {
         return Err(invalid(format!(
-            "it must belong to user {owner} and not be writable by others"
+            "it must belong to user {owner} and not be writable by group or others"
+        )));
+    }
+    if let Some(directory) = unsafe_ancestor(path, owner, home) {
+        return Err(invalid(format!(
+            "its directory {} can be changed by others",
+            directory.display()
         )));
     }
 
@@ -98,6 +104,28 @@ fn load(path: &Path, owner: u32) -> Result<Option<Config>, ConfigError> {
     Ok(Some(Config {
         packages_file: stored.packages_file,
     }))
+}
+
+fn is_private(metadata: &fs::Metadata, owner: u32) -> bool {
+    metadata.uid() == owner && metadata.mode() & 0o022 == 0
+}
+
+/// Finds a directory that would let others replace the file: its parent, and everything
+/// above it up to the home directory, which has rules of its own.
+fn unsafe_ancestor(path: &Path, owner: u32, home: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let is_unsafe = |directory: &Path| {
+        fs::metadata(directory).is_ok_and(|metadata| !is_private(&metadata, owner))
+    };
+    if is_unsafe(parent) {
+        return Some(parent.to_owned());
+    }
+    parent
+        .ancestors()
+        .skip(1)
+        .take_while(|directory| directory.starts_with(home) && *directory != home)
+        .find(|directory| is_unsafe(directory))
+        .map(Path::to_path_buf)
 }
 
 /// Writes the configuration atomically, creating the required directories.
@@ -212,7 +240,12 @@ mod tests {
     fn load_returns_none_when_missing() {
         let directory = tempfile::tempdir().unwrap();
         assert_eq!(
-            load(&directory.path().join("config.toml"), me()).unwrap(),
+            load(
+                &directory.path().join("config.toml"),
+                me(),
+                directory.path()
+            )
+            .unwrap(),
             None
         );
     }
@@ -225,7 +258,7 @@ mod tests {
 
         save(&path, &expected).unwrap();
 
-        assert_eq!(load(&path, me()).unwrap(), Some(expected));
+        assert_eq!(load(&path, me(), Path::new(HOME)).unwrap(), Some(expected));
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, CONFIG_MODE);
         let parent = fs::metadata(path.parent().unwrap()).unwrap();
         assert_eq!(parent.mode() & 0o777, DIRECTORY_MODE);
@@ -238,7 +271,7 @@ mod tests {
         fs::write(&path, "packages_file = [").unwrap();
 
         assert!(matches!(
-            load(&path, me()),
+            load(&path, me(), Path::new(HOME)),
             Err(ConfigError::Invalid { .. })
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), "packages_file = [");
@@ -251,7 +284,7 @@ mod tests {
         fs::write(&path, "other = 1\n").unwrap();
 
         assert!(matches!(
-            load(&path, me()),
+            load(&path, me(), Path::new(HOME)),
             Err(ConfigError::Invalid { .. })
         ));
     }
@@ -263,7 +296,10 @@ mod tests {
         for value in ["rel.nix", "/etc/shadow", "/etc/nixos/notes.txt"] {
             fs::write(&path, format!("packages_file = \"{value}\"\n")).unwrap();
             assert!(
-                matches!(load(&path, me()), Err(ConfigError::Invalid { .. })),
+                matches!(
+                    load(&path, me(), Path::new(HOME)),
+                    Err(ConfigError::Invalid { .. })
+                ),
                 "{value}"
             );
         }
@@ -275,16 +311,38 @@ mod tests {
         let path = directory.path().join("config.toml");
         fs::write(&path, "packages_file = \"/etc/nixos/p.nix\"\n").unwrap();
 
-        assert!(load(&path, me()).is_ok());
+        assert!(load(&path, me(), Path::new(HOME)).is_ok());
         assert!(matches!(
-            load(&path, me() + 1),
+            load(&path, me() + 1, Path::new(HOME)),
             Err(ConfigError::Invalid { .. })
         ));
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(matches!(
-            load(&path, me()),
-            Err(ConfigError::Invalid { .. })
-        ));
+        for mode in [0o666, 0o660] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(matches!(
+                load(&path, me(), Path::new(HOME)),
+                Err(ConfigError::Invalid { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn load_rejects_directories_others_could_change() {
+        let home = tempfile::tempdir().unwrap();
+        let share = home.path().join("share");
+        let directory = share.join("nixblend");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        fs::write(&path, "packages_file = \"/etc/nixos/p.nix\"\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let load_it = || load(&path, me(), home.path());
+        assert!(load_it().is_ok());
+
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(load_it(), Err(ConfigError::Invalid { .. })));
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+
+        fs::set_permissions(&share, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(load_it(), Err(ConfigError::Invalid { .. })));
     }
 
     #[test]

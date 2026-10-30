@@ -62,6 +62,10 @@ pub enum EditError {
     OutsideSystemConfig(PathBuf),
     #[error("{0} is writable by any user, so it cannot be edited with root privileges")]
     UnsafePermissions(PathBuf),
+    #[error("{0} has other hard links, so it cannot be used with root privileges")]
+    HardLinked(PathBuf),
+    #[error("'{0}' cannot be written as a package attribute")]
+    InvalidAttribute(String),
     #[error("{0} is not UTF-8 encoded")]
     NotUtf8(PathBuf),
     #[error("no permission to modify {0}. Run with sudo or adjust the permissions")]
@@ -138,6 +142,8 @@ pub enum AppError {
     Search(#[from] SearchError),
     #[error("search error: {0}")]
     SearchFailed(SearchError),
+    #[error("the search term is empty")]
+    EmptySearchTerm,
     #[error("package '{0}' was not found in nixpkgs. Nothing was changed")]
     PackageNotFound(String),
     #[error(

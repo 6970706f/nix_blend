@@ -253,7 +253,7 @@ contains "missing SUDO_UID" "SUDO_UID does not match" "$out"
 reset
 as_alice "$HOME_DIR/p.nix"; set_config "$HOME_DIR/p.nix"; chmod 666 "$CONFIG_DIR/config.toml"
 out=$(run 'y\n' ripgrep)
-contains "unsafe config" "not be writable by others" "$out"
+contains "unsafe config" "not be writable by group or others" "$out"
 
 # Variables that change how tools behave do not reach them while elevated.
 reset
@@ -264,6 +264,63 @@ echo "rebuild env NIX_CONFIG=[\${NIX_CONFIG:-}] LD=[\${LD_LIBRARY_PATH:-}]" >> $
 EOF
 env -i PATH="$W/evil:$ORIGINAL_PATH" HOME="$W/rh" SUDO_USER=alice SUDO_UID=1000 NIX_CONFIG=evil LD_LIBRARY_PATH=/evil "$W/bin/nixblend" reinstall git >/dev/null 2>&1 </dev/null
 contains "clean environment" "NIX_CONFIG=[] LD=[]" "$(cat "$W/tools.log")"
+
+# A variable outside the allowed list does not reach the rebuild, and HOME is root's.
+reset
+as_alice "$HOME_DIR/p.nix"; set_config "$HOME_DIR/p.nix"
+cat > "$W/trusted/nixos-rebuild" <<EOF
+#!$SH
+echo "rebuild env [\${PYTHONPATH:-}][\${BASH_ENV:-}][\${GIT_DIR:-}] HOME=\$HOME TERM=\${TERM:-}" >> $W/tools.log
+EOF
+env -i PATH="$W/evil:$ORIGINAL_PATH" HOME="$HOME_DIR" TERM=xterm SUDO_USER=alice SUDO_UID=1000 PYTHONPATH=/evil BASH_ENV=/evil GIT_DIR=/evil "$W/bin/nixblend" reinstall git >/dev/null 2>&1 </dev/null
+contains "allowed environment only" "rebuild env [][][] HOME=/root TERM=xterm" "$(cat "$W/tools.log")"
+
+# Groups of the user work under sudo, for a file of a secondary group.
+printf 'root:x:0:\nusers:x:100:alice\nwheel:x:200:alice\n' > "$W/etc/group"
+mount --bind "$W/etc/group" /etc/group || exit 95
+reset
+as_alice "$HOME_DIR/p.nix"; chown 1000:200 "$HOME_DIR/p.nix"; chmod 660 "$HOME_DIR/p.nix"; set_config "$HOME_DIR/p.nix"
+out=$(run 'y\nn\n' ripgrep)
+contains "secondary group" "Edit: package 'ripgrep' added" "$out"
+check "secondary group kept" "1000:200 660" "$(stat -c '%u:%g %a' "$HOME_DIR/p.nix")"
+
+# A shared file reachable only through a secondary group.
+reset
+mkdir -p "$W/shared"; chown 0:200 "$W/shared"; chmod 770 "$W/shared"
+printf "$LIST" > "$W/shared/p.nix"; chown 0:200 "$W/shared/p.nix"; chmod 660 "$W/shared/p.nix"
+set_config "$W/shared/p.nix"
+out=$(env -i PATH="$ORIGINAL_PATH" HOME="$W/rh" SUDO_USER=alice SUDO_UID=1000 "$W/bin/nixblend" list 2>&1 </dev/null)
+contains "shared file readable" "git" "$out"
+lacks "shared file not refused" "only used for files" "$out"
+
+# Being a member of a group does not open what belongs to root's groups only.
+reset
+printf 'x' > "$W/secret/group0.nix"; chown 0:0 "$W/secret/group0.nix"; chmod 640 "$W/secret/group0.nix"; chmod 750 "$W/secret"
+set_config "$W/secret/group0.nix"
+out=$(env -i PATH="$ORIGINAL_PATH" HOME="$W/rh" SUDO_USER=alice SUDO_UID=1000 "$W/bin/nixblend" list 2>&1 </dev/null)
+contains "root's group is not the user's" "only used for files under /etc/nixos" "$out"
+chmod 700 "$W/secret"
+
+# A configuration that cannot be evaluated does not stop the query, and it is reported.
+reset
+as_alice "$HOME_DIR/p.nix"; set_config "$HOME_DIR/p.nix"
+cp "$W/trusted/nix" "$W/nix.good"
+cat > "$W/trusted/nix" <<EOF
+#!$SH
+echo "nix \$*" >> $W/tools.log
+case "\$*" in
+  *nixosConfigurations*) echo "error: no such configuration" >&2; exit 1 ;;
+  *attrNames*) echo '[]' ;;
+  *" eval "*) echo '{"ripgrep":{"name":"ripgrep-1","pname":"ripgrep","version":"1","description":"d","available":false,"broken":false,"unfree":true,"insecure":false}}' ;;
+  *) echo '{}' ;;
+esac
+EOF
+out=$(env -i PATH="$ORIGINAL_PATH" HOME="$W/rh" SUDO_USER=alice SUDO_UID=1000 "$W/bin/nixblend" info ripgrep 2>&1 </dev/null)
+contains "fallback answers" "Version: 1" "$out"
+contains "fallback explained" "no such configuration" "$out"
+contains "fallback availability is unknown" "Status: Unknown" "$out"
+contains "fallback uses the locked revision" "stable-rev#legacyPackages" "$(cat "$W/tools.log")"
+cp "$W/nix.good" "$W/trusted/nix"
 
 [ "$FAILURES" -eq 0 ] && echo "ALL SCENARIOS PASSED"
 exit "$FAILURES"

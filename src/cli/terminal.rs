@@ -23,7 +23,7 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
     }
 
     fn say(&self, message: &str) -> io::Result<()> {
-        writeln!(self.output.borrow_mut(), "{message}")
+        writeln!(self.output.borrow_mut(), "{}", presenter::sanitize(message))
     }
 
     /// Asks a question and returns the answer without surrounding whitespace, or `None`
@@ -31,7 +31,7 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
     fn ask(&self, prompt: &str) -> io::Result<Option<String>> {
         {
             let mut output = self.output.borrow_mut();
-            write!(output, "{prompt} ")?;
+            write!(output, "{} ", presenter::sanitize(prompt))?;
             output.flush()?;
         }
         let mut answer = String::new();
@@ -48,9 +48,17 @@ impl<R: BufRead, W: Write> Interaction for Terminal<R, W> {
     }
 
     /// Only an explicit affirmative answer confirms; an empty or unknown answer, or the
-    /// end of the input, counts as a refusal.
+    /// end of the input, counts as a refusal. The exception is a question whose default
+    /// is to go on, which only an explicit no stops.
     fn confirm(&self, question: &Question) -> io::Result<bool> {
-        let answer = self.ask(&format!("{} [y/N]", presenter::question(question)))?;
+        let text = presenter::question(question);
+        if *question == Question::SearchDespiteTypo {
+            let answer = self.ask(&format!("{text} [Y/n]"))?;
+            return Ok(
+                !answer.is_some_and(|answer| matches!(answer.to_lowercase().as_str(), "n" | "no"))
+            );
+        }
+        let answer = self.ask(&format!("{text} [y/N]"))?;
         Ok(answer.is_some_and(|answer| matches!(answer.to_lowercase().as_str(), "y" | "yes")))
     }
 
@@ -66,6 +74,7 @@ impl<R: BufRead, W: Write> Interaction for Terminal<R, W> {
         page: &[Package],
         first_index: usize,
         has_more: bool,
+        offer_search: bool,
     ) -> io::Result<Choice> {
         if first_index == 0 && !page.is_empty() {
             self.say(&format!(
@@ -81,11 +90,17 @@ impl<R: BufRead, W: Write> Interaction for Terminal<R, W> {
         }
         let count = first_index + page.len();
         let more = if has_more { ", m for more" } else { "" };
+        let search = if offer_search {
+            ", s to search everything"
+        } else {
+            ""
+        };
         let answer = self.ask(&format!(
-            "Select a package [1-{count}{more}, Enter to cancel]"
+            "Select a package [1-{count}{more}{search}, Enter to cancel]"
         ))?;
         Ok(match answer.as_deref() {
             Some("m" | "M") if has_more => Choice::More,
+            Some("s" | "S") if offer_search => Choice::SearchAll,
             Some(text) => text
                 .parse::<usize>()
                 .ok()
@@ -127,12 +142,16 @@ mod tests {
     #[test]
     fn choose_returns_a_valid_index_or_gives_up() {
         assert_eq!(
-            terminal("2\n").choose_package("x", &[], 3, false).unwrap(),
+            terminal("2\n")
+                .choose_package("x", &[], 3, false, false)
+                .unwrap(),
             Choice::Index(1)
         );
         for answer in ["", "\n", "0\n", "4\n", "-1\n", "abc\n", "m\n"] {
             assert_eq!(
-                terminal(answer).choose_package("x", &[], 3, false).unwrap(),
+                terminal(answer)
+                    .choose_package("x", &[], 3, false, false)
+                    .unwrap(),
                 Choice::Cancel,
                 "{answer:?}"
             );
@@ -140,13 +159,59 @@ mod tests {
     }
 
     #[test]
+    fn control_characters_are_removed_from_messages() {
+        let term = terminal("");
+        term.notify(&Notice::Warning("bad\x1b[31m\tline".to_owned()))
+            .unwrap();
+        assert_eq!(output(term), "Warning: bad[31m\tline\n");
+    }
+
+    #[test]
+    fn a_question_that_defaults_to_going_on_only_stops_on_no() {
+        for answer in ["", "\n", "y\n", "whatever\n"] {
+            assert!(
+                terminal(answer)
+                    .confirm(&Question::SearchDespiteTypo)
+                    .unwrap(),
+                "{answer:?}"
+            );
+        }
+        for answer in ["n\n", "NO\n"] {
+            assert!(
+                !terminal(answer)
+                    .confirm(&Question::SearchDespiteTypo)
+                    .unwrap(),
+                "{answer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn choose_can_offer_a_full_search() {
+        assert_eq!(
+            terminal("s\n")
+                .choose_package("x", &[], 3, false, true)
+                .unwrap(),
+            Choice::SearchAll
+        );
+        assert_eq!(
+            terminal("s\n")
+                .choose_package("x", &[], 3, false, false)
+                .unwrap(),
+            Choice::Cancel
+        );
+    }
+
+    #[test]
     fn choose_offers_more_options_only_when_there_are_any() {
         assert_eq!(
-            terminal("m\n").choose_package("x", &[], 3, true).unwrap(),
+            terminal("m\n")
+                .choose_package("x", &[], 3, true, false)
+                .unwrap(),
             Choice::More
         );
         let term = terminal("\n");
-        term.choose_package("x", &[], 3, true).unwrap();
+        term.choose_package("x", &[], 3, true, false).unwrap();
         assert_eq!(
             output(term),
             "Select a package [1-3, m for more, Enter to cancel] "

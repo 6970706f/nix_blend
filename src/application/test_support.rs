@@ -37,6 +37,8 @@ struct FileState {
     backed_up: bool,
     invalid_current: bool,
     invalid_candidate: bool,
+    failing_undo: bool,
+    replacements: u32,
 }
 
 /// A use case's whole outside world, kept in memory.
@@ -117,6 +119,12 @@ impl Fixture {
 
     pub fn with_invalid_candidate(self) -> Self {
         self.file.borrow_mut().invalid_candidate = true;
+        self
+    }
+
+    /// The first replacement works, as an edit does, and the next one fails.
+    pub fn with_failing_undo(self) -> Self {
+        self.file.borrow_mut().failing_undo = true;
         self
     }
 
@@ -226,6 +234,13 @@ impl ManagedFile for FakeFile {
     }
 
     fn replace(&mut self, new_content: &str) -> Result<(), AppError> {
+        {
+            let mut state = self.state.borrow_mut();
+            state.replacements += 1;
+            if state.failing_undo && state.replacements > 1 {
+                return Err(EditError::ChangedOnDisk(self.path.clone()).into());
+            }
+        }
         new_content.clone_into(&mut self.content);
         new_content.clone_into(&mut self.state.borrow_mut().content);
         Ok(())
@@ -305,6 +320,10 @@ impl PackageCatalog for FakeCatalog<'_> {
     fn is_pinned(&self) -> bool {
         true
     }
+
+    fn warning(&self) -> Option<String> {
+        None
+    }
 }
 
 impl CatalogProvider for Fixture {
@@ -358,6 +377,7 @@ impl Interaction for Fixture {
         _page: &[Package],
         _first_index: usize,
         _has_more: bool,
+        _offer_search: bool,
     ) -> io::Result<Choice> {
         Ok(self.choice.get())
     }

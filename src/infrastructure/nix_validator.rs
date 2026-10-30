@@ -36,9 +36,11 @@ fn check_syntax_with(mut command: Command, content: File) -> Result<SyntaxCheck,
         .current_dir(Path::new("/"));
     match process::run(&mut command, TIMEOUT, &mut |_| {}) {
         Ok(output) if output.status.success() => Ok(SyntaxCheck::Valid),
-        Ok(output) => Err(EditError::InvalidNix(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        // Dying is not the same as rejecting the expression.
+        Ok(output) if output.status.code().is_none() => Err(EditError::ValidationFailed(
+            process::failure_reason(&output),
         )),
+        Ok(output) => Err(EditError::InvalidNix(process::failure_reason(&output))),
         Err(ProcessError::NotFound) => Ok(SyntaxCheck::ToolUnavailable),
         Err(ProcessError::Spawn(error)) => Err(EditError::ValidationFailed(error.to_string())),
         Err(ProcessError::TimedOut(limit)) => Err(EditError::ValidationFailed(format!(

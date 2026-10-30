@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::package::{DeclarationKind, PackageName};
+use crate::domain::package::DeclarationKind;
 use crate::domain::resolution::{InstallCheck, PackageRequest, check_install};
 
 const DOCUMENT: NixPackageDocument = NixPackageDocument;
@@ -604,4 +604,51 @@ fn removal_does_not_touch_similar_names_or_strings() {
         removed(source, "git"),
         "{ pkgs }: with pkgs; [\n  git-lfs\n  \"git\"\n  # git\n]\n"
     );
+}
+
+#[test]
+fn add_refuses_what_is_not_an_attribute() {
+    let source = "{ pkgs }: with pkgs; [ git ]";
+    let identity = PackageIdentity::nixpkgs("evil ] ++ [ pkgs.foo");
+    assert!(matches!(
+        DOCUMENT.add(source, &identity),
+        Err(EditError::InvalidAttribute(_))
+    ));
+}
+
+#[test]
+fn accepts_rec_sets() {
+    assert!(
+        edited(
+            "{ pkgs, ... }: rec { home.packages = [ pkgs.git ]; }",
+            "foo"
+        )
+        .contains("[ pkgs.git pkgs.foo ]")
+    );
+    assert!(
+        edited(
+            "{ pkgs, ... }: { home = rec { packages = [ pkgs.git ]; }; }",
+            "foo"
+        )
+        .contains("[ pkgs.git pkgs.foo ]")
+    );
+    assert!(
+        refusal("{ pkgs, lib, ... }: lib.mkIf true rec { home.packages = [ ]; }")
+            .contains("top level")
+    );
+}
+
+#[test]
+fn unusual_entries_are_one_declaration_each() {
+    let found = declarations("{ pkgs, x }: with pkgs; [ <nixpkgs> ./a${x}/b rec { y = 1; } git ]");
+    let texts: Vec<&str> = found.iter().map(|entry| entry.0.as_str()).collect();
+    assert_eq!(texts, ["<nixpkgs>", "./a${x}/b", "rec { y = 1; }", "git"]);
+    assert_eq!(found[2].1, None);
+}
+
+#[test]
+fn long_or_chains_do_not_exhaust_the_stack() {
+    let chain = "a or ".repeat(200_000);
+    let source = format!("{{ pkgs }}: with pkgs; [ {chain}b ]");
+    assert_eq!(declarations(&source).len(), 1);
 }

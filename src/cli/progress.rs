@@ -30,16 +30,21 @@ impl TerminalProgress {
 impl ProgressReporter for TerminalProgress {
     fn update(&self, label: &str, seconds: u64) {
         if self.enabled && seconds >= QUIET_SECONDS {
-            eprint!("{CLEAR_LINE}{label}... {seconds}s (Ctrl+C to cancel)");
-            let _ = io::stderr().flush();
+            let mut stderr = io::stderr();
+            let _ = write!(
+                stderr,
+                "{CLEAR_LINE}{label}... {seconds}s (Ctrl+C to cancel)"
+            );
+            let _ = stderr.flush();
             self.drawn.set(true);
         }
     }
 
     fn finish(&self) {
         if self.drawn.replace(false) {
-            eprint!("{CLEAR_LINE}");
-            let _ = io::stderr().flush();
+            let mut stderr = io::stderr();
+            let _ = write!(stderr, "{CLEAR_LINE}");
+            let _ = stderr.flush();
         }
     }
 }

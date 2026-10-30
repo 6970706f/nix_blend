@@ -13,7 +13,7 @@ use structure::{ListSite, Tokens};
 use crate::application::error::EditError;
 use crate::application::ports::PackageDocument;
 use crate::domain::package::{
-    ChannelAlias, DeclaredPackages, PackageDeclaration, PackageIdentity, PackageSource,
+    ChannelAlias, DeclaredPackages, PackageDeclaration, PackageIdentity, PackageName, PackageSource,
 };
 
 const PKGS_PREFIX: &str = "pkgs.";
@@ -49,6 +49,10 @@ impl PackageDocument for NixPackageDocument {
     }
 
     fn add(&self, source: &str, identity: &PackageIdentity) -> Result<String, EditError> {
+        // The last line of defense: whatever the source of this name, it becomes Nix code.
+        if PackageName::parse(&identity.attr).is_err() {
+            return Err(EditError::InvalidAttribute(identity.attr.clone()));
+        }
         let tokens = tokenize(source)?;
         let view = Tokens {
             source,

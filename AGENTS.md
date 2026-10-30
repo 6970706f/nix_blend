@@ -9,13 +9,11 @@ Nixblend é um gerenciador de pacotes para NixOS com experiência de uso semelha
 - Use Rust estável e mantenha a implementação simples, modular e extensível.
 - Comece como um único binário organizado por módulos. Não introduza uma arquitetura distribuída, plugins ou abstrações genéricas sem uma necessidade concreta.
 - Separe responsabilidades:
-  - `cli`: definição e interpretação dos comandos e argumentos.
-  - `config`: leitura, validação e persistência das configurações do Nixblend.
-  - `packages`: descoberta, validação e inclusão de pacotes em `packages.nix`.
-  - `nix`: interação com ferramentas do ecossistema Nix.
-  - `rebuild`: execução e acompanhamento do rebuild do NixOS.
-  - `ui`: perguntas, confirmações, mensagens e apresentação do diff.
-  - `error`: tipos e conversão de erros da aplicação.
+  - `domain`: modelos e regras de negócio, sem depender de CLI, arquivos, processos ou ferramentas Nix.
+  - `application`: um módulo por caso de uso e `ports.rs` com as interfaces (traits) de que precisam; `application::error` tem os tipos de erro.
+  - `infrastructure`: implementações das interfaces: ferramentas Nix, edição de arquivos `.nix`, gravação atômica, processos, sinais, configuração e privilégios.
+  - `cli`: definição dos comandos e argumentos, apresentação, perguntas, mensagens e diff.
+  - `main.rs`: único ponto que conecta as camadas. As dependências apontam para dentro: `cli` → `application` → `domain`, e `infrastructure` implementa os ports.
 - Mantenha a lógica de negócio independente da interface de terminal sempre que isso não gerar complexidade desnecessária.
 - Defina interfaces pequenas entre módulos. Evite módulos que conheçam detalhes internos de todos os outros.
 - Não antecipe funcionalidades futuras sem requisito real; preserve pontos de extensão claros.
@@ -27,7 +25,7 @@ Nixblend é um gerenciador de pacotes para NixOS com experiência de uso semelha
 - Evite `unwrap()` e `expect()` em caminhos normais de execução. Retorne erros com contexto útil.
 - Não use `unsafe` sem necessidade técnica demonstrável e justificativa documentada.
 - Evite alocações, clonagens, dependências e processos externos desnecessários. Não use async sem uma necessidade concreta.
-- Não crie abstrações, traits ou camadas apenas por antecipação.
+- Não crie abstrações, traits ou camadas apenas por antecipação. Os ports de `application` já existem para isolar o exterior; novos só com necessidade concreta.
 - Documente APIs públicas e decisões não óbvias; não escreva comentários que apenas repetem o código.
 - Execute `cargo fmt` e `cargo clippy --all-targets --all-features -- -D warnings` antes de considerar uma alteração concluída.
 
@@ -64,7 +62,7 @@ Nixblend é um gerenciador de pacotes para NixOS com experiência de uso semelha
 - Evite dependências pesadas quando a biblioteca padrão ou uma dependência pequena resolver o problema.
 - Não invoque `nix`, `nixos-rebuild` ou outros processos externos para tarefas que podem ser resolvidas localmente.
 - Não faça varreduras recursivas ou leituras repetidas do mesmo arquivo sem necessidade.
-- Mantenha o fluxo síncrono enquanto não houver uma necessidade concreta de concorrência.
+- Mantenha o fluxo síncrono enquanto não houver uma necessidade concreta de concorrência. Threads existem apenas para ler pipes de processos e tratar sinais.
 
 ## Testes e qualidade
 

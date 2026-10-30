@@ -8,6 +8,10 @@ use super::package::{
 const PKGS_PREFIX: &str = "pkgs.";
 /// Largest edit distance still considered a typo.
 const MAX_TYPO_DISTANCE: usize = 2;
+/// Longest word in which only one edit counts as a typo.
+const SHORT_WORD: usize = 4;
+/// Shortest term that may be questioned as a typo before a search.
+const MIN_TYPO_LENGTH: usize = 5;
 
 /// A package name interpreted against the package sets a file imports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,16 +247,26 @@ pub fn resolve_results(results: Vec<Package>, name: &str) -> Resolution {
     Resolution::Candidates(matches.into_iter().map(|(_, package)| package).collect())
 }
 
+/// Edits still considered a typo. In a short word, two edits make almost anything match.
+fn typo_limit(term: &str) -> usize {
+    if term.len() <= SHORT_WORD {
+        1
+    } else {
+        MAX_TYPO_DISTANCE
+    }
+}
+
 /// Attribute names close to `term`: likely typos and names containing it, best
 /// first. This lets a typo be answered without a full search.
 pub fn near_names(names: &[String], term: &str, limit: usize) -> Vec<String> {
     let term = term.to_lowercase();
+    let limit_edits = typo_limit(&term);
     let mut near: Vec<(usize, &String)> = names
         .iter()
         .filter_map(|name| {
             let lower = name.to_lowercase();
             let distance = edit_distance(&lower, &term);
-            if distance <= MAX_TYPO_DISTANCE {
+            if distance <= limit_edits {
                 Some((distance, name))
             } else if term.len() >= 3 && lower.contains(&term) {
                 Some((MAX_TYPO_DISTANCE + name.len() - term.len(), name))
@@ -268,24 +282,22 @@ pub fn near_names(names: &[String], term: &str, limit: usize) -> Vec<String> {
         .collect()
 }
 
-/// Attribute names a few edits away from `term`, closest first, unless `term` is itself
-/// an attribute. These suggest a typo, as opposed to a partial name or a description.
+/// Attribute names one edit away from `term`, when `term` looks like a typo: it is long
+/// enough to tell, and it is not part of any attribute name. A word that appears in names
+/// is a legitimate term, and so is anything that may only appear in descriptions, unless
+/// a name is this close to it.
 pub fn likely_typos(names: &[String], term: &str, limit: usize) -> Vec<String> {
-    if names.iter().any(|name| name == term) {
+    let term = term.to_lowercase();
+    if term.len() < MIN_TYPO_LENGTH || names.iter().any(|name| name.to_lowercase().contains(&term))
+    {
         return Vec::new();
     }
-    let term = term.to_lowercase();
-    let mut close: Vec<(usize, &String)> = names
+    let mut close: Vec<&String> = names
         .iter()
-        .map(|name| (edit_distance(&name.to_lowercase(), &term), name))
-        .filter(|(distance, _)| *distance <= MAX_TYPO_DISTANCE)
+        .filter(|name| edit_distance(&name.to_lowercase(), &term) == 1)
         .collect();
     close.sort();
-    close
-        .into_iter()
-        .take(limit)
-        .map(|(_, name)| name.clone())
-        .collect()
+    close.into_iter().take(limit).cloned().collect()
 }
 
 /// Levenshtein distance, giving up once it clearly exceeds the typo limit.
@@ -623,9 +635,20 @@ mod tests {
             .map(str::to_owned)
             .collect();
         assert_eq!(likely_typos(&names, "firefx", 5), ["firefox"]);
+        // Real names, parts of names, unrelated text and short words are legitimate.
         assert!(likely_typos(&names, "firefox", 5).is_empty());
         assert!(likely_typos(&names, "fire", 5).is_empty());
         assert!(likely_typos(&names, "web browser", 5).is_empty());
+        assert!(likely_typos(&names, "gif", 5).is_empty());
+        let words: Vec<String> = ["browsers", "cbrowser", "p0f"].map(str::to_owned).to_vec();
+        assert!(likely_typos(&words, "browser", 5).is_empty());
+        assert!(likely_typos(&words, "pdf", 5).is_empty());
+    }
+
+    #[test]
+    fn short_words_only_accept_one_edit() {
+        let names: Vec<String> = ["gate", "age", "ace"].map(str::to_owned).to_vec();
+        assert_eq!(near_names(&names, "kate", 10), ["gate"]);
     }
 
     #[test]

@@ -38,9 +38,16 @@ file, edit or delete that one.
 5. Saves a backup and replaces the file atomically, keeping its owner and mode.
 6. Offers the rebuild. If it fails, the edit is kept unless you choose to undo it.
 
-A typo is answered from the list of attribute names, which takes about a second. A full
-search only runs if you agree, since the first one for a nixpkgs revision takes about a
-minute and several GB of memory.
+A typo is answered from the list of attribute names, which takes about a second, with the
+option of searching everything. Only that sees nested attributes, so `kate` finds
+`kdePackages.kate` that way. A full search only runs if you agree, since the first one for
+a nixpkgs revision takes about a minute and several GB of memory.
+
+### search
+
+Searches names and descriptions, showing details a page at a time. A term that is not part
+of any name but is one edit away from one, like `firefx`, asks first; only an explicit `n`
+skips the search.
 
 ### remove
 
@@ -104,15 +111,22 @@ structures, and the real Nix parser validates every result.
   The managed file is too, whenever that user can do it; otherwise root privileges apply
   only to files under `/etc/nixos`. Searches and syntax checks never run as root.
 - **Tools.** While elevated, tools come from `/run/current-system/sw/bin`, must be owned
-  by root and not writable by others, and do not inherit `LD_*` or `NIX_*` variables.
-- **Paths.** The stored path is validated on every run. The directory is opened once and
-  the file is reached through it without following symlinks, so swapping a path after the
-  checks has no effect.
-- **Transactions.** Changes made by others while a command waits are detected, not
-  overwritten. The previous content is kept in `.<file>.nixblend-backup`, next to the file
+  by root and not writable by others, and inherit only a short list of harmless variables,
+  with `HOME` set to `/root`.
+- **Limits of `sudo`.** Allowing someone to run only `nixblend` through `sudo` is not a
+  security boundary: it can rebuild the system, and if `/etc/nixos` belongs to that person,
+  the rebuild runs as root a configuration they wrote.
+- **Paths.** The stored path is validated on every run, and the configuration must not be
+  writable by group or others, nor sit in a directory that is. The directory of the managed
+  file is opened once and the file is reached through it without following symlinks, so
+  swapping a path after the checks has no effect. With root privileges, a file with other
+  hard links is refused.
+- **Transactions.** Changes to the content, owner or mode made while a command waits are
+  detected, not overwritten. The previous content is kept in `.<file>.nixblend-backup`, next to the file
   and with its owner and mode.
-- **Temporary files.** They are removed on success, failure and Ctrl+C. After `SIGKILL` or
-  a power loss, the next run removes them.
+- **Interruption.** Ctrl+C and `SIGTERM` end the running tool and remove temporary files. A
+  rebuild is left to finish, since stopping it halfway is worse, unless Ctrl+C reaches it
+  from the terminal. After `SIGKILL` or a power loss, the next run removes temporary files.
 - **Time limits.** Queries give up after 3 minutes and full searches after 10, reporting
   the real error. A failed search is never reported as a missing package. The rebuild has
   no limit, because it can legitimately take hours, and its output is shown as it runs.
@@ -125,6 +139,7 @@ structures, and the real Nix parser validates every result.
 | 1 | Nothing was installed or removed: invalid input, unknown package, failed validation or failed edit |
 | 2 | Invalid command line |
 | 3 | The rebuild failed. Any edit stays applied, unless you chose to undo it |
+| 141 | Whoever was reading the output went away, as in `nixblend search foo \| head`. An edit may have been applied |
 
 ## Architecture
 

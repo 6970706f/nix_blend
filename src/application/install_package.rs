@@ -109,7 +109,11 @@ impl InstallPackage<'_> {
         services
             .ui
             .notify(&Notice::Checking(identity.qualified()))?;
-        let package = match catalog.exact(&identity.attr)? {
+        let exact = catalog.exact(&identity.attr)?;
+        if let Some(warning) = catalog.warning() {
+            services.ui.notify(&Notice::Warning(warning))?;
+        }
+        let package = match exact {
             Some(package) => package,
             None => match self.find_similar(catalog.as_ref(), identity)? {
                 Some(package) => package,
@@ -129,7 +133,8 @@ impl InstallPackage<'_> {
     }
 
     /// Looks for what the user may have meant. Typos are answered from the attribute
-    /// names, which is cheap; the slow full search only runs if the user agrees.
+    /// names, which is cheap; the slow full search only runs if the user agrees. It is
+    /// always an option, since only it sees nested attributes like `kdePackages.kate`.
     fn find_similar(
         &self,
         catalog: &dyn PackageCatalog,
@@ -139,30 +144,46 @@ impl InstallPackage<'_> {
         let attr = &identity.attr;
         let names = catalog.names()?;
         let near = near_names(&names, attr, CHOICE_PAGE);
-        if !near.is_empty() {
-            let packages = catalog.metadata(&near)?;
-            let candidates: Vec<Package> = near
-                .iter()
-                .filter_map(|name| packages.get(name).cloned())
-                .collect();
-            if !candidates.is_empty() {
-                return self.choose(identity, candidates);
+        let packages = if near.is_empty() {
+            Default::default()
+        } else {
+            catalog.metadata(&near)?
+        };
+        let candidates: Vec<Package> = near
+            .iter()
+            .filter_map(|name| packages.get(name).cloned())
+            .collect();
+
+        if candidates.is_empty() {
+            services
+                .ui
+                .notify(&Notice::NoCloseMatch(identity.qualified()))?;
+            if !services
+                .ui
+                .confirm(&Question::RunFullSearch(identity.qualified()))?
+            {
+                return Err(AppError::NotExactAttribute(identity.qualified()));
+            }
+        } else {
+            match self.choose(identity, candidates, true)? {
+                Picked::Package(package) => return Ok(Some(*package)),
+                Picked::Cancelled => return Ok(None),
+                Picked::SearchAll => {}
             }
         }
 
-        services
-            .ui
-            .notify(&Notice::NoCloseMatch(identity.qualified()))?;
-        if !services
-            .ui
-            .confirm(&Question::RunFullSearch(identity.qualified()))?
-        {
-            return Err(AppError::NotExactAttribute(identity.qualified()));
-        }
-        match resolve_results(catalog.search(attr)?, attr) {
-            Resolution::Found(package) => Ok(Some(package)),
+        let mut results = catalog.search(attr)?;
+        // What a source reports is not trusted to be safe to write to a Nix file.
+        results.retain(|package| PackageName::parse(&package.identity.attr).is_ok());
+        match resolve_results(results, attr) {
+            Resolution::Found(package) => Ok(Some(with_source_of(identity, package))),
             Resolution::NotFound => Err(AppError::PackageNotFound(identity.qualified())),
-            Resolution::Candidates(candidates) => self.choose(identity, candidates),
+            Resolution::Candidates(candidates) => {
+                match self.choose(identity, candidates, false)? {
+                    Picked::Package(package) => Ok(Some(*package)),
+                    Picked::Cancelled | Picked::SearchAll => Ok(None),
+                }
+            }
         }
     }
 
@@ -172,7 +193,8 @@ impl InstallPackage<'_> {
         &self,
         identity: &PackageIdentity,
         mut candidates: Vec<Package>,
-    ) -> Result<Option<Package>, AppError> {
+        offer_search: bool,
+    ) -> Result<Picked, AppError> {
         candidates.retain(|package| PackageName::parse(&package.identity.attr).is_ok());
         if candidates.is_empty() {
             return Err(AppError::PackageNotFound(identity.qualified()));
@@ -186,18 +208,27 @@ impl InstallPackage<'_> {
                 &candidates[shown..end],
                 shown,
                 end < candidates.len(),
+                offer_search,
             )?;
             shown = end;
             match choice {
                 Choice::Index(index) if index < shown => {
                     let chosen = candidates.swap_remove(index);
-                    return Ok(Some(with_source_of(identity, chosen)));
+                    return Ok(Picked::Package(Box::new(with_source_of(identity, chosen))));
                 }
                 Choice::More => {}
-                Choice::Index(_) | Choice::Cancel => return Ok(None),
+                Choice::SearchAll => return Ok(Picked::SearchAll),
+                Choice::Index(_) | Choice::Cancel => return Ok(Picked::Cancelled),
             }
         }
     }
+}
+
+/// Outcome of offering candidates to the user.
+enum Picked {
+    Package(Box<Package>),
+    SearchAll,
+    Cancelled,
 }
 
 /// Candidates come from the catalog of the requested source.
@@ -294,6 +325,52 @@ mod tests {
         run(&fixture, "firefx").unwrap();
         assert!(fixture.content().contains("firefox"));
         assert_eq!(fixture.searches(), 0);
+    }
+
+    #[test]
+    fn a_full_search_is_always_an_option_when_candidates_are_offered() {
+        let nested = Package {
+            identity: PackageIdentity::nixpkgs("kdePackages.kate"),
+            metadata: crate::domain::package::PackageMetadata {
+                pname: Some("kate".to_owned()),
+                ..Default::default()
+            },
+        };
+        let fixture = Fixture::new(LIST)
+            .with_package("gate")
+            .with(nested)
+            .choosing(Choice::SearchAll)
+            .answering(&[true, false]);
+        run(&fixture, "kate").unwrap();
+        assert_eq!(fixture.searches(), 1);
+        assert!(fixture.content().contains("kdePackages.kate"));
+    }
+
+    #[test]
+    fn search_results_that_cannot_be_written_are_ignored() {
+        let mut bad = package("evil ] ++ [ pkgs.foo");
+        bad.metadata.pname = Some("foo".to_owned());
+        let fixture = Fixture::new(LIST).with(bad).answering(&[true]);
+        let error = run(&fixture, "foo").unwrap_err();
+        assert!(matches!(error, AppError::PackageNotFound(_)));
+        assert_eq!(fixture.content(), LIST);
+    }
+
+    #[test]
+    fn failed_undo_keeps_the_rebuild_failure_as_the_outcome() {
+        let fixture = Fixture::new(LIST)
+            .with_package("foo")
+            .with_failing_rebuild()
+            .with_failing_undo()
+            .answering(&[true, true, true]);
+        let error = run(&fixture, "foo").unwrap_err();
+        assert!(matches!(error, AppError::Rebuild(_)));
+        assert!(
+            fixture
+                .notices()
+                .iter()
+                .any(|notice| matches!(notice, Notice::UndoFailed(_)))
+        );
     }
 
     #[test]

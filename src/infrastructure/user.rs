@@ -13,14 +13,19 @@ use super::tools;
 use crate::application::error::UserError;
 
 const PASSWD_PATH: &str = "/etc/passwd";
+const GROUP_PATH: &str = "/etc/group";
 const GETENT: &str = "getent";
 
 /// User who owns the Nixblend data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserIdentity {
+    pub name: String,
     pub uid: u32,
     pub gid: u32,
     pub home: PathBuf,
+    /// All groups of the user, known only when the process is elevated and has to act
+    /// as that user.
+    pub groups: Vec<u32>,
 }
 
 /// Tells whether the process is running with root privileges.
@@ -47,26 +52,72 @@ pub fn current() -> Result<UserIdentity, UserError> {
         )
     };
 
-    match resolve_from(&passwd) {
-        Err(UserError::UnknownUser(name)) => directory_entry(&name, euid == 0)
+    let mut user = match resolve_from(&passwd) {
+        Err(UserError::UnknownUser(name)) => lookup(&["passwd", &name], euid == 0)
             .map_or(Err(UserError::UnknownUser(name)), |entry| {
                 resolve_from(&entry)
             }),
-        Err(UserError::UnknownUid(uid)) => directory_entry(&uid.to_string(), euid == 0)
+        Err(UserError::UnknownUid(uid)) => lookup(&["passwd", &uid.to_string()], euid == 0)
             .map_or(Err(UserError::UnknownUid(uid)), |entry| {
                 resolve_from(&entry)
             }),
         result => result,
+    }?;
+    if euid == 0 && user.uid != 0 {
+        user.groups = groups_of(&user);
     }
+    Ok(user)
 }
 
-/// Asks the system's name service for an entry missing from `/etc/passwd`, which
-/// covers users from LDAP or `systemd-homed`. Any failure means "no entry".
-fn directory_entry(key: &str, elevated: bool) -> Option<String> {
+/// All groups of an elevated process's original user, through the name service if
+/// possible. The primary group is always there, which is the safe minimum.
+fn groups_of(user: &UserIdentity) -> Vec<u32> {
+    let listed = lookup(&["initgroups", &user.name], true)
+        .map(|entry| parse_initgroups(&entry))
+        .or_else(|| {
+            let groups = fs::read_to_string(GROUP_PATH).ok()?;
+            Some(parse_group_file(&groups, &user.name))
+        })
+        .unwrap_or_default();
+    let mut groups = vec![user.gid];
+    groups.extend(listed.into_iter().filter(|gid| *gid != user.gid));
+    groups
+}
+
+/// Reads `name   gid gid ...`, as printed by `getent initgroups`.
+fn parse_initgroups(entry: &str) -> Vec<u32> {
+    entry
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|gid| gid.parse().ok())
+        .collect()
+}
+
+/// Finds the groups listing `name` in a file in the `group` format.
+fn parse_group_file(groups: &str, name: &str) -> Vec<u32> {
+    groups
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(':');
+            let _group_name = fields.next()?;
+            let _password = fields.next()?;
+            let gid = fields.next()?.parse().ok()?;
+            let members = fields.next()?;
+            members
+                .split(',')
+                .any(|member| member == name)
+                .then_some(gid)
+        })
+        .collect()
+}
+
+/// Asks the system's name service, which covers users from LDAP or `systemd-homed`. Any
+/// failure means "no entry".
+fn lookup(arguments: &[&str], elevated: bool) -> Option<String> {
     let mut command = Command::new(tools::program(GETENT, elevated).ok()?);
     tools::apply_environment(&mut command, elevated, None);
     let output = command
-        .args(["passwd", key])
+        .args(arguments)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -117,7 +168,16 @@ fn passwd_entries(passwd: &str) -> impl Iterator<Item = (&str, UserIdentity)> {
         let home = PathBuf::from(fields.next()?);
         // -1 is reserved by the kernel and does not identify a user.
         let valid = uid != u32::MAX && gid != u32::MAX && home.is_absolute();
-        valid.then_some((name, UserIdentity { uid, gid, home }))
+        valid.then_some((
+            name,
+            UserIdentity {
+                name: name.to_owned(),
+                uid,
+                gid,
+                home,
+                groups: Vec::new(),
+            },
+        ))
     })
 }
 
@@ -127,8 +187,8 @@ fn passwd_entries(passwd: &str) -> impl Iterator<Item = (&str, UserIdentity)> {
 /// This way the kernel itself prevents symlinks in the home directory from
 /// leading root to write outside it, and new files get the right owner from the
 /// start. The calls only affect the current thread, which is the one doing file
-/// access: other threads only read pipes or clean up temporary files. Supplementary
-/// groups are reduced to the primary group, since they are root's otherwise.
+/// access: other threads only read pipes or clean up temporary files. The groups are
+/// those of the user, since they are root's otherwise.
 pub struct PrivilegeGuard {
     restore: Option<(Uid, Gid, Vec<Gid>)>,
 }
@@ -141,18 +201,35 @@ pub fn drop_privileges(user: &UserIdentity) -> Result<PrivilegeGuard, UserError>
         return Ok(PrivilegeGuard { restore: None });
     }
 
-    let groups = getgroups().map_err(|error| UserError::Privileges(error.into()))?;
-    set_effective_ids(Uid::from_raw(user.uid), Gid::from_raw(user.gid), euid, egid)
-        .map_err(UserError::Privileges)?;
+    let saved_groups = getgroups().map_err(|error| UserError::Privileges(error.into()))?;
+    let groups: Vec<Gid> = if user.groups.is_empty() {
+        vec![Gid::from_raw(user.gid)]
+    } else {
+        user.groups.iter().map(|gid| Gid::from_raw(*gid)).collect()
+    };
+    set_effective_ids(
+        Uid::from_raw(user.uid),
+        Gid::from_raw(user.gid),
+        &groups,
+        euid,
+        egid,
+    )
+    .map_err(UserError::Privileges)?;
     Ok(PrivilegeGuard {
-        restore: Some((euid, egid, groups)),
+        restore: Some((euid, egid, saved_groups)),
     })
 }
 
 /// Changes the GID before the UID: after giving up UID 0, switching to an
 /// arbitrary GID would no longer be allowed.
-fn set_effective_ids(uid: Uid, gid: Gid, saved_uid: Uid, saved_gid: Gid) -> io::Result<()> {
-    set_thread_groups(&[gid])?;
+fn set_effective_ids(
+    uid: Uid,
+    gid: Gid,
+    groups: &[Gid],
+    saved_uid: Uid,
+    saved_gid: Gid,
+) -> io::Result<()> {
+    set_thread_groups(groups)?;
     set_thread_res_gid(None, gid, saved_gid)?;
     if let Err(error) = set_thread_res_uid(None, uid, saved_uid) {
         let _ = set_thread_res_gid(None, saved_gid, saved_gid);
@@ -184,9 +261,11 @@ mod tests {
 
     fn alice() -> UserIdentity {
         UserIdentity {
+            name: "alice".to_owned(),
             uid: 1000,
             gid: 100,
             home: PathBuf::from("/home/alice"),
+            groups: Vec::new(),
         }
     }
 
@@ -216,6 +295,18 @@ mod tests {
     #[test]
     fn root_without_sudo_is_root() {
         assert_eq!(resolve(0, 0, None, None, PASSWD).unwrap().uid, 0);
+    }
+
+    #[test]
+    fn group_sources_are_parsed() {
+        assert_eq!(parse_initgroups("alice   100 1 57\n"), [100, 1, 57]);
+        assert_eq!(
+            parse_group_file(
+                "root:x:0:\nwheel:x:1:bob,alice\naudio:x:2:bob\nmalformed\n",
+                "alice"
+            ),
+            [1]
+        );
     }
 
     #[test]
